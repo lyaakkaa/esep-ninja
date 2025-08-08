@@ -1,0 +1,22 @@
+{% load i18n admin_urls %}
+{% block object-tools-items %}
+<script src="https://ajax.googleapis.com/ajax/libs/jquery/3.6.4/jquery.min.js"></script>
+<li>
+    {% url opts|admin_urlname:'history' original.pk|admin_urlquote as history_url %}
+    {{mymodel}}
+    <a href="{{ download_total_report_url }}" class="historylink" style="margin-right: 10px">Скачать полный отчет</a>
+    <a href="javascript:run_rollback_changes()" class="historylink" style="margin-right: 10px">Откатиться</a>
+    <a href="{% add_preserved_filters history_url %}" class="historylink">History</a>
+</li>
+<script>
+    function run_rollback_changes() {
+        $('#updatehistory_form').append('<input type="hidden" name="run_rollback_changes" value="" />');
+        $('#updatehistory_form').submit()
+    }
+    function download_total_report() {
+        $('#updatehistory_form').append('<input type="hidden" name="download_total_report" value="" />');
+        $('#updatehistory_form').submit()
+    }
+</script>
+{% if has_absolute_url %}<li><a href="{{ absolute_url }}" class="viewsitelink">{% translate "View on site" %}</a></li>{% endif %}
+{% endblock %}

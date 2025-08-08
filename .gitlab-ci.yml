@@ -1,0 +1,53 @@
+stages:
+  - build
+  - deploy
+
+variables:
+  DJANGO_SETTINGS_MODULE: config.settings
+  MYSQL_HOST: db
+  MYSQL_DATABASE: updaterninja
+  MYSQL_ROOT_PASSWORD: ninjapassword
+  PMA_HOST: db
+  PMA_USER: root
+  PMA_PASSWORD: ninjapassword
+  UPLOAD_LIMIT: 300M
+  ESEP_DB_HOST: 192.168.1.17
+  ESEP_DB_USER: sultan_a
+  ESEP_DB_PASSWORD: 'L$xUQyBQ'
+  ESEP_DB_NAME: esep
+  GIT_STRATEGY: clone
+  PYTHONDONTWRITEBYTECODE: 1
+  PYTHONUNBUFFERED: 1
+
+build-job:
+  stage: build
+  tags:
+    - esep-ninja
+  before_script:
+    - git config --global --add safe.directory $CI_PROJECT_DIR
+  script:
+    - echo "Generating .env.dev..."
+    - echo "Building Docker containers..."
+    - docker-compose -f docker-compose.yml build
+  artifacts:
+    paths:
+      - .env.dev
+    expire_in: 1 hour
+
+deploy-job:
+  stage: deploy
+  tags:
+    - esep-ninja
+  dependencies:
+    - build-job
+  script:
+    - echo "Stopping existing containers..."
+    # - cd /home/bekzhan.s/esep_updater_ninja/
+    # - docker-compose -f docker-compose.yml down --remove-orphans || true
+    # - echo "Starting updated containers..."
+    - docker-compose -f docker-compose.yml up -d
+    - echo "Checking container status..."
+    # - docker ps | grep esep || echo "No containers found"
+  only:
+    - main
+    - develop
