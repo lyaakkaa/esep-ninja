@@ -16,11 +16,11 @@ class UpdateStatuses(TextChoices):
 
 
 class ReportTypes(TextChoices):
-    ZERO_IN_ACA_NOT_IN_ESEP = "ZERO_IN_ACA_NOT_IN_ESEP", "0 в АСА, нет в Есеп"
-    IN_ACA_NOT_IN_ESEP = "IN_ACA_NOT_IN_ESEP", "Есть в АСА, но нет в Есеп"
-    IN_ACA_NO_ACCOUNT_IN_ESEP = "IN_ACA_NO_ACCOUNT_IN_ESEP", "Есть в АСА, но нет в Есепе даже ЛС"
-    IN_ESEP_NOT_IN_ACA = "IN_ESEP_NOT_IN_ACA", "Есть в Есеп, но нет в АСА"
+    ZERO_IN_VODOKANAL_NOT_IN_ESEP = "ZERO_IN_VODOKANAL_NOT_IN_ESEP", "0 в VODOKANAL, нет в Есеп"
+    IN_VODOKANAL_NOT_IN_ESEP = "IN_VODOKANAL_NOT_IN_ESEP", "Есть в VODOKANAL, но нет в Есеп"
+    IN_VODOKANAL_NO_ACCOUNT_IN_ESEP = "IN_VODOKANAL_NO_ACCOUNT_IN_ESEP", "Есть в VODOKANAL, но нет в Есепе даже ЛС"
+    IN_ESEP_NOT_IN_VODOKANAL = "IN_ESEP_NOT_IN_VODOKANAL", "Есть в Есеп, но нет в VODOKANAL"
     ADDED_NEW_DEVICES = "ADDED_NEW_DEVICES", "Добавлены Новые Счетчики"
     REMOVED_REDUNDANT_DEVICES = "REMOVED_REDUNDANT_DEVICES", "Удалены Лишние Счетчики"
     SUCCESSFULLY_UPDATED_DEVICES = "SUCCESSFULLY_UPDATED_DEVICES", "Успешно обновленные Счетчики"
-    EMPTY_BODY_FROM_ACA_API = "EMPTY_BODY_FROM_ACA_API", "Пустой объект от ACA API"
+    EMPTY_BODY_FROM_VODOKANAL_API = "EMPTY_BODY_FROM_VODOKANAL_API", "Пустой объект от VODOKANAL API"

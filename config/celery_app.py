@@ -16,9 +16,15 @@ cel_app.conf.visibility_timeout = 43200
 cel_app.conf.task_acks_late = True
 
 cel_app.conf.beat_schedule = {
+    # ACA
     'update-outdated-esep-devices-periodic-task': {
         'task': 'apps.common.tasks.update_outdated_esep_devices_periodic_task',
-        'schedule': crontab(hour=2, minute=00)
+        'schedule': crontab(hour=2, minute=0)
+    },
+    # Кокшетау
+    'update-outdated-kok-devices-periodic-task': {
+        'task': 'apps.common.tasks.update_outdated_kok_devices_periodic_task',
+        'schedule': crontab(hour=3, minute=0)
     },
 }
 
