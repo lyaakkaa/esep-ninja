@@ -9,7 +9,7 @@ import requests
 import mysql.connector
 from datetime import datetime, timedelta, date
 from constance import config
-from django.db import OperationalError, transaction
+from django.db import OperationalError, transaction, close_old_connections
 from django.utils import timezone
 
 from apps.common import UpdatingTypes, ReportTypes, UpdateStatuses
@@ -109,8 +109,10 @@ def normalize_phone(s: Optional[str]) -> Optional[str]:
 
 @cel_app.task
 def run_rollback_task(update_obj_pk):
+    close_old_connections()
     update_instance = UpdateHistory.objects.filter(pk=update_obj_pk).first()
     if not update_instance:
+        close_old_connections()
         print('No instance')
         return
 
@@ -186,6 +188,7 @@ def update_outdated_esep_devices_periodic_task():
 @cel_app.task(bind=True, max_retries=5)
 def update_esep_db_task(self, update_obj_pk: int, account_numbers: list = None):
     # logger.info(f"Запускаю update_esep_db_task, id={update_obj_pk}")
+    close_old_connections()
     update_instance = UpdateHistory.objects.filter(pk=update_obj_pk).first()
     COMPANY_ID = 7
 
@@ -312,6 +315,7 @@ def update_esep_db_task(self, update_obj_pk: int, account_numbers: list = None):
         update_instance.status_reason = error_msg
 
     finally:
+        close_old_connections()
         update_instance.completed_at = timezone.now()
         update_instance.save()
 
