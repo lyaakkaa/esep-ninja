@@ -1,0 +1,248 @@
+--- a/apps/common/tasks.py
++++ b/apps/common/tasks.py
+@@ -1,15 +1,16 @@
+ import csv
+ import logging
+ import math
+ import re
+ from typing import Optional, List, Tuple, Dict
+
+ import chardet
+ import requests
+ import mysql.connector
+ from datetime import datetime, timedelta, date
+ from constance import config
+-from django.db import OperationalError, transaction
++from django.db import OperationalError, transaction, close_old_connections
+ from django.utils import timezone
+
+ from apps.common import UpdatingTypes, ReportTypes, UpdateStatuses
+ from apps.common.models import UpdateHistory, UpdateHistoryReport, UpdateHistoryRollback
+ from apps.common.services import get_connection_to_esep_db
+@@ -53,6 +54,15 @@ def log_changes(label: str, ctx: LogCtx, changes: List[Tuple[str, str, str]]):
+     if not changes:
+         return
+     # logger.debug(...)
+
++def _same_values(before: dict, after: dict) -> bool:
++    """
++    Быстрая проверка: все поля after совпадают с before?
++    """
++    if not after:
++        return True
++    for k, v in after.items():
++        if before.get(k) != v:
++            return False
++    return True
++
+ def _safe_digits_only(x) -> str:
+     """Вернёт только цифры из x. Никогда не кидает исключения."""
+     try:
+         return re.sub(r'\D', '', str(x))
+@@ -169,6 +179,7 @@ def update_outdated_esep_devices_periodic_task():
+ @cel_app.task(bind=True, max_retries=5)
+ def update_esep_db_task(self, update_obj_pk: int, account_numbers: list = None):
+     # logger.info(f"Запускаю update_esep_db_task, id={update_obj_pk}")
++    close_old_connections()
+     update_instance = UpdateHistory.objects.filter(pk=update_obj_pk).first()
+     COMPANY_ID = 7
+
+@@ -250,6 +261,7 @@ def update_esep_db_task(self, update_obj_pk: int, account_numbers: list = None):
+     finally:
++        close_old_connections()
+         update_instance.completed_at = timezone.now()
+         update_instance.save()
+
+@@ -319,6 +331,7 @@ def synchronize_esep_db_with_aca_data(
+     try:
+         connection = get_connection_to_esep_db()
+         if connection.is_connected():
+             cursor = connection.cursor(buffered=True)
+             connection.autocommit = False
+             cursor.execute("SELECT DATABASE();")
+             _ = cursor.fetchone()
+@@ -330,7 +343,17 @@ def synchronize_esep_db_with_aca_data(
+         raise Exception(f"Error while connecting to MySQL: {str(e)}")
+
+     try:
+-        for aca_account_number, aca_account_payload in (aca_loaded_data or {}).items():
++        for aca_account_number, aca_account_payload in (aca_loaded_data or {}).items():
++            # === мини-транзакция на один Л/С ===
++            try:
++                # минимизируем длительность локов
++                try:
++                    cursor.execute("SET SESSION TRANSACTION ISOLATION LEVEL READ COMMITTED")
++                except Exception as _iso_err:
++                    logger.warning(f"READ COMMITTED not set: {str(_iso_err)}")
++                connection.start_transaction()
++            except Exception as _tx_err:
++                logger.error(f"can't start txn for acc={aca_account_number}: {_tx_err}")
++                continue
+             # payload в унифицированном формате
+             if isinstance(aca_account_payload, dict) and 'devices' in aca_account_payload:
+                 aca_account_devices = aca_account_payload.get('devices', []) or []
+                 aca_account_phone = normalize_phone(
+@@ -379,32 +402,41 @@ def synchronize_esep_db_with_aca_data(
+             # ---- тянем устройства (строго этой компании) ----
+-            cursor.execute("""
+-                SELECT b.number  AS account_number,
+-                       d.id      AS device_id,
+-                       i.id      AS indication_id,
+-                       d.number  AS device_number,
+-                       i.value,
+-                       i.created_at, i.updated_at,
+-                       d.last_check, d.next_check,
+-                       d.company_id, d.resource_type_id,
+-                       d.modem_number,
+-                       d.name_ru, d.name_kk, d.name_en,
+-                       d.comment, d.updated_by, d.updated_at,
+-                       i.deleted_at
+-                  FROM devices d
+-             LEFT JOIN indications i ON d.id = i.device_id
+-             INNER JOIN bank_books b ON b.id = d.bankbook_id
+-                 WHERE b.number = %s
+-                   AND b.company_id = %s
+-                   AND d.company_id = %s
+-                   AND d.deleted_at IS NULL
+-                   AND (
+-                        i.id = (SELECT i2.id
+-                                  FROM indications i2
+-                                 WHERE i2.device_id = d.id
+-                              ORDER BY i2.updated_at DESC, i2.id DESC
+-                                 LIMIT 1)
+-                        OR i.id IS NULL
+-                   )
+-            """, (account_id, bb_company_id, bb_company_id))
++            cursor.execute("""
++                SELECT b.number  AS account_number,
++                       d.id      AS device_id,
++                       i.id      AS indication_id,
++                       d.number  AS device_number,
++                       i.value,
++                       i.created_at, i.updated_at,
++                       d.last_check, d.next_check,
++                       d.company_id, d.resource_type_id,
++                       d.modem_number,
++                       d.name_ru, d.name_kk, d.name_en,
++                       d.comment, d.updated_by, d.updated_at,
++                       i.deleted_at
++                  FROM devices d
++                  JOIN bank_books b ON b.id = d.bankbook_id
++             LEFT JOIN (
++                    SELECT x.device_id,
++                           x.updated_at,
++                           x.id
++                      FROM indications x
++                      JOIN (
++                           SELECT device_id, MAX(updated_at) AS mu
++                             FROM indications
++                            GROUP BY device_id
++                      ) m ON m.device_id = x.device_id AND m.mu = x.updated_at
++             ) last ON last.device_id = d.id
++             LEFT JOIN indications i
++                    ON i.device_id = last.device_id
++                   AND i.updated_at = last.updated_at
++                   AND i.id         = last.id
++                 WHERE b.number = %s
++                   AND b.company_id = %s
++                   AND d.company_id = %s
++                   AND d.deleted_at IS NULL
++            """, (account_id, bb_company_id, bb_company_id))
+             esep_db_data = cursor.fetchall()
+
+             esep_devices, devices_without_indications = [], []
+             devices_for_delete, excluding_changed = {}, []
+@@ -453,13 +485,18 @@ def synchronize_esep_db_with_aca_data(
+                 for k, v in zip(params_dict['keys'], params_dict['values']):
+                     after_dev[k] = v
+
+-                set_clause = ",".join(f"`{k}` = %s" for k in params_dict['keys'])
+-                cursor.execute(
+-                    f"UPDATE devices SET {set_clause}, comment = %s, updated_by = 693, updated_at = NOW() WHERE id = %s",
+-                    (*params_dict['values'], f"ninja_update {str(update_obj_pk)}", esep_device['id'])
+-                )
++                if not _same_values(before_dev, after_dev):
++                    set_clause = ",".join(f"`{k}` = %s" for k in params_dict['keys'])
++                    cursor.execute(
++                        f"UPDATE devices SET {set_clause}, comment = %s, updated_by = 693, updated_at = NOW() WHERE id = %s",
++                        (*params_dict['values'], f"ninja_update {str(update_obj_pk)}", esep_device['id'])
++                    )
++                else:
++                    # нет изменений — пропускаем UPDATE
++                    pass
+
+                 total_report_json['rollback_data']['update']['devices'].append((
+                     esep_device['id'],
+                     esep_device['last_check'].strftime('%Y-%m-%d') if esep_device['last_check'] else None,
+                     current_next_check,
+@@ -515,13 +552,18 @@ def synchronize_esep_db_with_aca_data(
+                     for k, v in zip(params_dict['keys'], params_dict['values']):
+                         after_dev[k] = v
+
+-                    set_clause = ",".join(f"`{k}` = %s" for k in params_dict['keys'])
+-                    cursor.execute(
+-                        f"UPDATE devices SET {set_clause}, comment = %s, updated_by = 693, updated_at = NOW() WHERE id = %s",
+-                        (*params_dict['values'], f"ninja_update {str(update_obj_pk)}", dwi['id'])
+-                    )
++                    if not _same_values(before_dev, after_dev):
++                        set_clause = ",".join(f"`{k}` = %s" for k in params_dict['keys'])
++                        cursor.execute(
++                            f"UPDATE devices SET {set_clause}, comment = %s, updated_by = 693, updated_at = NOW() WHERE id = %s",
++                            (*params_dict['values'], f"ninja_update {str(update_obj_pk)}", dwi['id'])
++                        )
++                    else:
++                        # нет изменений — пропускаем UPDATE
++                        pass
+
+                     total_report_json['rollback_data']['update']['devices'].append((
+                         dwi['id'],
+                         dwi['last_check'].strftime('%Y-%m-%d') if dwi['last_check'] else None,
+                         current_next_check,
+@@ -598,13 +640,25 @@ def synchronize_esep_db_with_aca_data(
+                 total_report_json[ReportTypes.IN_VODOKANAL_NOT_IN_ESEP].append(
+                     (str(aca_account_number), d.get('device_number'))
+                 )
+
+-        # SAVE ALL CHANGES INTO DATABASE
+-        logger.info(f"[SYNC] committing changes upd={update_obj_pk}")
+-        connection.commit()
++            # === успешный коммит по этому Л/С ===
++            try:
++                connection.commit()
++            except Exception as commit_err:
++                logger.error(f"[SYNC] commit error for acc={aca_account_number}: {commit_err}")
++                raise
+
+-    except Exception as e:
+-        connection.rollback()
+-        logger.error(f"[SYNC] error, rolling back upd={update_obj_pk}: {str(e)}")
++    except Exception as e:
++        try:
++            connection.rollback()
++        except Exception:
++            pass
++        logger.error(f"[SYNC] error, full rollback upd={update_obj_pk}: {str(e)}")
+         print("Changes rolled back! The error occured: ", str(e))
+         raise
+     finally:
+         if connection.is_connected():
+             cursor.close()
+             connection.close()
+         logger.info(f"[SYNC] done upd={update_obj_pk}")
+@@ -705,6 +759,7 @@ def update_kok_db_task(self, update_obj_pk: int, account_numbers: list = None):
+     COMPANY_ID = 10
+     logger.info(f"Запускаю update_kok_db_task, id={update_obj_pk}")
++    close_old_connections()
+     update_instance = UpdateHistory.objects.filter(pk=update_obj_pk).first()
+     if not update_instance:
+         raise self.retry(exc=OperationalError("Instance not found"))
+@@ -760,6 +815,7 @@ def update_kok_db_task(self, update_obj_pk: int, account_numbers: list = None):
+     except Exception as e:
+         msg = str(e)
+         logger.error(msg)
+         update_instance.status = UpdateStatuses.FAILED
+         update_instance.status_reason = msg
+     finally:
++        close_old_connections()
+         update_instance.completed_at = timezone.now()
+         update_instance.save()

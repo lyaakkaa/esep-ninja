@@ -6,8 +6,6 @@ volumes:
   un_mysql_data:
   un_portainer_data:
   redis_data:
-  esep_updater_ninja_un_mysql_data:
-    external: true
 
 networks:
   un-net:
@@ -23,19 +21,8 @@ services:
     volumes:
       - .:/updaterninja
       - media:/media
-    environment:
-      - DJANGO_SETTINGS_MODULE=config.settings
-      - MYSQL_HOST=db
-      - MYSQL_DATABASE=updaterninja
-      - MYSQL_ROOT_PASSWORD=ninjapassword
-      - PMA_HOST=db
-      - PMA_USER=root
-      - PMA_PASSWORD=ninjapassword
-      - UPLOAD_LIMIT=300M
-      - ESEP_DB_HOST=192.168.1.17
-      - ESEP_DB_USER=sultan_a
-      - ESEP_DB_PASSWORD=L$$xUQyBQ
-      - ESEP_DB_NAME=esep
+    env_file:
+      - ./.env.dev
     ports:
       - "8008:8000"
     depends_on:
@@ -48,10 +35,9 @@ services:
     container_name: db
     restart: always
     volumes:
-      - esep_updater_ninja_un_mysql_data:/var/lib/mysql
-    environment:
-      - MYSQL_DATABASE=updaterninja
-      - MYSQL_ROOT_PASSWORD=ninjapassword
+      - un_mysql_data:/var/lib/mysql
+    env_file:
+      - ./.env.dev
     networks:
       - un-net
     ports:
@@ -59,13 +45,9 @@ services:
 
   phpmyadmin:
     image: phpmyadmin/phpmyadmin:latest
-    container_name: phpmyadmin
     restart: always
-    environment:
-      - PMA_ARBITRARY=1
-      - PMA_HOST=db
-      - PMA_USER=root
-      - PMA_PASSWORD=ninjapassword
+    env_file:
+      - ./.env.dev
     networks:
       - un-net
     ports:
@@ -82,12 +64,8 @@ services:
     volumes:
       - .:/updaterninja
       - media:/media
-    environment:
-      - DJANGO_SETTINGS_MODULE=config.settings
-      - ESEP_DB_HOST=192.168.1.17
-      - ESEP_DB_USER=sultan_a
-      - ESEP_DB_PASSWORD=L$$xUQyBQ
-      - ESEP_DB_NAME=esep
+    env_file:
+      - ./.env.dev
     depends_on:
       - ninja-worker
       - ninja-server
@@ -104,12 +82,8 @@ services:
     volumes:
       - .:/updaterninja
       - media:/media
-    environment:
-      - DJANGO_SETTINGS_MODULE=config.settings
-      - ESEP_DB_HOST=192.168.1.17
-      - ESEP_DB_USER=sultan_a
-      - ESEP_DB_PASSWORD=L$$xUQyBQ
-      - ESEP_DB_NAME=esep
+    env_file:
+      - ./.env.dev
     networks:
       - un-net
     command: "celery -A config.celery_app worker --loglevel=INFO"
@@ -117,7 +91,6 @@ services:
   ninja-portainer:
     container_name: ninja-portainer
     image: portainer/portainer-ce:latest
-    restart: always
     environment:
       - TZ=Asia/Almaty
     ports:
@@ -125,17 +98,34 @@ services:
     volumes:
       - un_portainer_data:/data
       - /var/run/docker.sock:/var/run/docker.sock
-    networks:
-      - un-net
+    restart: always
 
   ninja-redis:
     container_name: ninja-redis
-    image: redis:latest
     restart: unless-stopped
+    image: redis
     command: redis-server --appendonly yes --replica-read-only no
     ports:
       - "6380:6379"
     volumes:
       - redis_data:/data
+    env_file:
+      - ./.env.dev
     networks:
       - un-net
+
+  ninja-flower:
+    container_name: ninja-flower
+    image: mher/flower
+    restart: always
+    environment:
+      - CELERY_BROKER_URL=redis://ninja-redis:6379/0
+    ports:
+      - "5555:5555"
+    depends_on:
+      - ninja-redis
+      - ninja-worker
+    networks:
+      - un-net
+
+

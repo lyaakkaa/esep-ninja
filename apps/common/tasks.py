@@ -1,14 +1,15 @@
 import csv
 import logging
+import math
 import re
-from typing import Optional, List, Tuple
+from typing import Optional, List, Tuple, Dict
 
 import chardet
 import requests
 import mysql.connector
 from datetime import datetime, timedelta, date
 from constance import config
-from django.db import OperationalError
+from django.db import OperationalError, transaction
 from django.utils import timezone
 
 from apps.common import UpdatingTypes, ReportTypes, UpdateStatuses
@@ -58,9 +59,9 @@ def log_changes(label: str, ctx: LogCtx, changes: List[Tuple[str, str, str]]):
     """
     if not changes:
         return
-    logger.info(f"{label} {ctx}: changes:")
-    for f, o, n in changes:
-        logger.info(f"    - {f}: '{o}' -> '{n}'")
+    # logger.debug(f"{label} {ctx}: changes:")
+    # for f, o, n in changes:
+    #     logger.debug(f"    - {f}: '{o}' -> '{n}'")
 
 
 def _safe_digits_only(x) -> str:
@@ -68,7 +69,7 @@ def _safe_digits_only(x) -> str:
     try:
         return re.sub(r'\D', '', str(x))
     except Exception as e:
-        logger.warning(f"_safe_digits_only: type={type(x)} val={repr(x)} err={e}")
+        # logger.warning(f"_safe_digits_only: type={type(x)} val={repr(x)} err={e}")
         return ""
 
 def _safe_split_ws(x) -> list[str]:
@@ -76,7 +77,7 @@ def _safe_split_ws(x) -> list[str]:
     try:
         return [p for p in re.split(r'\s+', str(x)) if p]
     except Exception as e:
-        logger.warning(f"_safe_split_ws: type={type(x)} val={repr(x)} err={e}")
+        # logger.warning(f"_safe_split_ws: type={type(x)} val={repr(x)} err={e}")
         return [str(x)]
 
 
@@ -166,10 +167,9 @@ def update_outdated_esep_devices_periodic_task():
         connection.close()
 
         if numeric_accounts:
-            # передаём в update_esep_db_task как Celery–задачу
             update_esep_db_task.delay(update_obj_pk=update_instance.pk,
                                       account_numbers=numeric_accounts)
-            logger.info("Запущена подзадача update_esep_db_task")
+        # logger.info(f"Запущено {total_chunks} подзадач update_esep_db_task")
         else:
             logger.info("Нет устаревших ЛС для обновления")
     except Exception as e:
@@ -185,8 +185,9 @@ def update_outdated_esep_devices_periodic_task():
 
 @cel_app.task(bind=True, max_retries=5)
 def update_esep_db_task(self, update_obj_pk: int, account_numbers: list = None):
-    logger.info(f"Запускаю update_esep_db_task, id={update_obj_pk}")
+    # logger.info(f"Запускаю update_esep_db_task, id={update_obj_pk}")
     update_instance = UpdateHistory.objects.filter(pk=update_obj_pk).first()
+    COMPANY_ID = 7
 
     if not update_instance:
         raise self.retry(exc=OperationalError("Instance not found"))
@@ -207,17 +208,17 @@ def update_esep_db_task(self, update_obj_pk: int, account_numbers: list = None):
                     account_number=str(account_number).strip(),
                     api_key=config.ACA_SERVICE_API_KEY
                 )
-                logger.info(f"Запрос к ACA API: {api_url}")
+                # logger.debug(f"Запрос к ACA API: {api_url}")
 
                 try:
                     start_ts = datetime.now()
                     response = requests.get(api_url, verify=False, timeout=10)
                     latency_ms = int((datetime.now() - start_ts).total_seconds() * 1000)
-                    logger.info(f"[ACA API] {account_number}: http={response.status_code} latency_ms={latency_ms} len={len(response.content) if response.content else 0}")
+                    # logger.debug(f"[ACA API] {account_number}: http={response.status_code} latency_ms={latency_ms} len={len(response.content) if response.content else 0}")
 
                     if response.status_code != 200:
-                        logger.warning(f"Некорректный статус ответа от ACA: {response.status_code}")
-                        logger.warning(f"Тело ответа: {response.text}")
+                        # logger.warning(f"Некорректный статус ответа от ACA: {response.status_code}")
+                        # logger.warning(f"Тело ответа: {response.text}")
 
                         if response.status_code == 404:
                             empty_accounts.append(account_number)
@@ -227,18 +228,19 @@ def update_esep_db_task(self, update_obj_pk: int, account_numbers: list = None):
                                 if error_data.get("error") == "wrong apikey":
                                     raise Exception("wrong apikey")
                             except ValueError:
-                                logger.error(f"ACA API вернул не-JSON тело при ошибке: {response.text}")
+                                continue
+                                # logger.error(f"ACA API вернул не-JSON тело при ошибке: {response.text}")
                         continue
 
                     if not (response.headers.get('Content-Type') or '').startswith('application/json'):
-                        logger.error(f"ACA API вернул неожиданный Content-Type: {response.headers.get('Content-Type')}")
-                        logger.error(f"Тело ответа: {response.text}")
+                        # logger.error(f"ACA API вернул неожиданный Content-Type: {response.headers.get('Content-Type')}")
+                        # logger.error(f"Тело ответа: {response.text}")
                         continue
 
                     try:
                         account_data = response.json()
                     except ValueError:
-                        logger.error(f"Не удалось разобрать JSON от ACA API. Тело ответа: {response.text}")
+                        # logger.error(f"Не удалось разобрать JSON от ACA API. Тело ответа: {response.text}")
                         continue
 
                     # нет счётчиков — запоминaем для отчёта
@@ -269,16 +271,16 @@ def update_esep_db_task(self, update_obj_pk: int, account_numbers: list = None):
                     }
 
                 except requests.exceptions.RequestException as req_err:
-                    logger.error(f"Ошибка при запросе к ACA API: {req_err}")
+                    # logger.error(f"Ошибка при запросе к ACA API: {req_err}")
                     continue
 
             # Вызов синхронизации после сбора всех данных
-            total_report_json = synchronize_esep_db_with_aca_data(accounts_data, update_obj_pk)
+            total_report_json = synchronize_esep_db_with_aca_data(accounts_data, update_obj_pk, COMPANY_ID)
             total_report_json[ReportTypes.EMPTY_BODY_FROM_VODOKANAL_API] = empty_accounts
 
         elif update_instance.updating_type == UpdatingTypes.BY_FILE:
             csv_data = get_aca_devices_from_csv_file(update_instance.data_file.path)
-            total_report_json = synchronize_esep_db_with_aca_data(csv_data, update_obj_pk)
+            total_report_json = synchronize_esep_db_with_aca_data(csv_data, update_obj_pk, COMPANY_ID)
 
         else:
             raise Exception(f"Неизвестный тип обновления: {update_instance.updating_type}")
@@ -299,7 +301,6 @@ def update_esep_db_task(self, update_obj_pk: int, account_numbers: list = None):
                     },
                 ) for report_type in total_report_json
             ])
-
         update_instance.status = UpdateStatuses.SUCCESS
 
     except Exception as e:
@@ -389,7 +390,7 @@ def synchronize_esep_db_with_aca_data(
         }
     }
 
-    logger.info(f"[SYNC] start: items={len(aca_loaded_data)} company_scope={company_id if company_id is not None else 'ALL'} upd={update_obj_pk}")
+    # logger.info(f"[SYNC] start: items={len(aca_loaded_data)} company_scope={company_id if company_id is not None else 'ALL'} upd={update_obj_pk}")
 
     def remove_first_occurrence(device_list, device_number):
         for i, device in enumerate(device_list):
@@ -423,13 +424,13 @@ def synchronize_esep_db_with_aca_data(
                 aca_account_phone, new_name, new_people = None, None, None
 
             if not aca_account_number or not str(aca_account_number).strip().isdigit():
-                logger.warning(f"Skipping invalid account number key: '{aca_account_number}'")
+                # logger.warning(f"Skipping invalid account number key: '{aca_account_number}'")
                 continue
 
             account_id = int(str(aca_account_number).strip())
 
             ctx = LogCtx(account_number=aca_account_number, company_id=company_id, update_id=update_obj_pk)
-            logger.info(f"[SYNC] {ctx} processing... devices_from_source={len(aca_account_devices)} phone={aca_account_phone or '-'} name={new_name or '-'} people={new_people if new_people is not None else '-'}")
+            # logger.debug(f"[SYNC] {ctx} processing... devices_from_source={len(aca_account_devices)} phone={aca_account_phone or '-'} name={new_name or '-'} people={new_people if new_people is not None else '-'}")
 
             # ---- bank_book (учитываем company_id если задан) ----
             if company_id is None:
@@ -445,7 +446,7 @@ def synchronize_esep_db_with_aca_data(
             bankbook = cursor.fetchone()
             if not bankbook:
                 total_report_json[ReportTypes.IN_VODOKANAL_NO_ACCOUNT_IN_ESEP].add(str(aca_account_number))
-                logger.info(f"[BANK_BOOK MISS] {ctx} bank_book not found for account")
+                logger.debug(f"[BANK_BOOK MISS] {ctx} bank_book not found for account")
                 continue
 
             bankbook_id, bb_company_id, current_phone, current_name, current_people = (
@@ -528,12 +529,9 @@ def synchronize_esep_db_with_aca_data(
                         "updated_at": el[17],
                     })
 
-            print('======')
-            print(aca_account_number)
 
             # MAKE PAIRS ACA DEVICE WITH ESEP DEVICE
             device_pairs, account_report_data = make_pairs(aca_account_devices, esep_devices, aca_account_number)
-            print(account_report_data)
 
             # ---- обновляем bank_books (phone / name / people) + rollback ----
             sets, values = [], []
@@ -557,7 +555,7 @@ def synchronize_esep_db_with_aca_data(
                 if new_people is not None and new_people != current_people:
                     after["people"] = new_people
 
-                log_changes("[BANK_BOOK UPDATE]", ctx, diff_record(before, after))
+                # log_changes("[BANK_BOOK UPDATE]", ctx, diff_record(before, after))
 
                 total_report_json['rollback_data']['bank_books'].append((
                     bankbook_id, current_phone, current_name, current_people,
@@ -571,10 +569,10 @@ def synchronize_esep_db_with_aca_data(
 
             # ---- апдейты сопоставленных устройств ----
             for aca_device, esep_device in device_pairs:
-                print(
-                    f"([{aca_device.get('device_number')}, {aca_device.get('value')}], "
-                    f"[{esep_device.get('device_number')}, {esep_device.get('value')}])"
-                )
+                # print(
+                #     f"([{aca_device.get('device_number')}, {aca_device.get('value')}], "
+                #     f"[{esep_device.get('device_number')}, {esep_device.get('value')}])"
+                # )
 
                 current_next_check = esep_device['next_check'].strftime('%Y-%m-%d') if esep_device['next_check'] else None
                 params_dict = get_params_for_update(aca_device, current_next_check=current_next_check)
@@ -595,7 +593,7 @@ def synchronize_esep_db_with_aca_data(
                 for k, v in zip(params_dict['keys'], params_dict['values']):
                     after_dev[k] = v
 
-                log_changes("[DEVICE UPDATE] " + f"(dev_id={esep_device['id']} dev_num={esep_device['device_number']})", ctx, diff_record(before_dev, after_dev))
+                # log_changes("[DEVICE UPDATE] " + f"(dev_id={esep_device['id']} dev_num={esep_device['device_number']})", ctx, diff_record(before_dev, after_dev))
 
                 set_clause = ",".join(f"`{k}` = %s" for k in params_dict['keys'])
                 cursor.execute(
@@ -659,7 +657,7 @@ def synchronize_esep_db_with_aca_data(
                     for k, v in zip(params_dict['keys'], params_dict['values']):
                         after_dev[k] = v
 
-                    log_changes("[DEVICE UPDATE (NO INDICATION)] " + f"(dev_id={dwi['id']} dev_num={dwi['device_number']})", ctx, diff_record(before_dev, after_dev))
+                    # log_changes("[DEVICE UPDATE (NO INDICATION)] " + f"(dev_id={dwi['id']} dev_num={dwi['device_number']})", ctx, diff_record(before_dev, after_dev))
 
                     set_clause = ",".join(f"`{k}` = %s" for k in params_dict['keys'])
                     cursor.execute(
@@ -693,7 +691,7 @@ def synchronize_esep_db_with_aca_data(
                         f"comment = 'ninja_update {str(update_obj_pk)}' "
                         f"WHERE id IN ({placeholders})"
                     )
-                    logger.info(f"[DEVICE DELETE MARK] {ctx}: ids={list(devices_for_delete.keys())} numbers={list(devices_for_delete.values())}")
+                    # logger.info(f"[DEVICE DELETE MARK] {ctx}: ids={list(devices_for_delete.keys())} numbers={list(devices_for_delete.values())}")
                     cursor.execute(sql_query, list(devices_for_delete.keys()))
                     print("sql_query: ", sql_query, list(devices_for_delete.keys()))
                     # saves the list of ids marked as deleted
@@ -729,7 +727,7 @@ def synchronize_esep_db_with_aca_data(
                     if device_row:
                         device_id = device_row[0]
                     else:
-                        logger.info(f"[DEVICE INSERT] {ctx}: account={aca_account_number} will_insert={params_dict}")
+                        # logger.info(f"[DEVICE INSERT] {ctx}: account={aca_account_number} will_insert={params_dict}")
                         cursor.execute(
                             "INSERT INTO devices (" + ", ".join(
                                 f"`{key}`" for key in params_dict['keys']) +
@@ -738,7 +736,7 @@ def synchronize_esep_db_with_aca_data(
                             (*params_dict['values'], bankbook_id, bb_company_id, f"ninja_update {str(update_obj_pk)}", 0)
                         )
                         device_id = cursor.lastrowid
-                        logger.info(f"[DEVICE INSERTED] {ctx}: new_device_id={device_id} number={new_device.get('device_number')}")
+                        # logger.info(f"[DEVICE INSERTED] {ctx}: new_device_id={device_id} number={new_device.get('device_number')}")
                         total_report_json['rollback_data']['delete']['devices'].append(device_id)
                         print(device_id)
 
@@ -796,9 +794,9 @@ def make_pairs(aca_devices: list, esep_devices: list, account_number=''):
         reports_data[ReportTypes.ADDED_NEW_DEVICES].extend(aca_devices)
         return [], reports_data
 
-    logger.info(f"[PAIR] start account={account_number} aca_len={len(aca_devices)} esep_len={len(esep_devices)}")
-    print("initial aca_devices: ", aca_devices)
-    print("initial esep_devices: ", esep_devices)
+    # logger.info(f"[PAIR] start account={account_number} aca_len={len(aca_devices)} esep_len={len(esep_devices)}")
+    # print("initial aca_devices: ", aca_devices)
+    # print("initial esep_devices: ", esep_devices)
 
     # MAPPING BY DEVICE NUMBER
     for aca_device in aca_devices:
@@ -811,22 +809,22 @@ def make_pairs(aca_devices: list, esep_devices: list, account_number=''):
                 esep_device = esep_device[0]
                 pairs.append((aca_device, esep_device))
                 esep_devices.remove(esep_device)
-                logger.info(f"[PAIR BY NUMBER] account={account_number} device={aca_device.get('device_number')} -> esep_id={esep_device['id']}")
+                # logger.info(f"[PAIR BY NUMBER] account={account_number} device={aca_device.get('device_number')} -> esep_id={esep_device['id']}")
             else:
                 if aca_device.get('value') is None:
                     reports_data[ReportTypes.ZERO_IN_VODOKANAL_NOT_IN_ESEP].append((account_number, aca_device.get('device_number')))
-                    logger.info(f"[PAIR ZERO] account={account_number} device={aca_device.get('device_number')} => ZERO_IN_VODOKANAL_NOT_IN_ESEP")
+                    # logger.info(f"[PAIR ZERO] account={account_number} device={aca_device.get('device_number')} => ZERO_IN_VODOKANAL_NOT_IN_ESEP")
                 else:
                     untitled_devices.append(aca_device)
 
     # если все сопоставили по номеру, разнести хвосты
     if len(untitled_devices) == 0 and len(esep_devices) > 0:
         for i in esep_devices:
-            logger.info(f"[PAIR TAIL ESEP] account={account_number} not_matched_esep={i['device_number']}")
+            # logger.info(f"[PAIR TAIL ESEP] account={account_number} not_matched_esep={i['device_number']}")
             reports_data[ReportTypes.IN_ESEP_NOT_IN_VODOKANAL].append((account_number, i['device_number']))
     elif len(untitled_devices) > 0 and len(esep_devices) == 0:
         for i in untitled_devices:
-            logger.info(f"[PAIR TAIL ACA] account={account_number} not_matched_aca={i.get('device_number')}")
+            # logger.info(f"[PAIR TAIL ACA] account={account_number} not_matched_aca={i.get('device_number')}")
             reports_data[ReportTypes.IN_VODOKANAL_NOT_IN_ESEP].append(i)
     elif len(untitled_devices) > 0 and len(esep_devices) > 0:
         # MAPPING BY CLOSEST VALUES (без падений на None)
@@ -840,25 +838,25 @@ def make_pairs(aca_devices: list, esep_devices: list, account_number=''):
             except Exception:
                 return 0
 
-        logger.info(f"[PAIR BY VALUE] account={account_number}: trying to match {len(untitled_devices)} untitled vs {len(esep_devices)} esep")
+        # logger.info(f"[PAIR BY VALUE] account={account_number}: trying to match {len(untitled_devices)} untitled vs {len(esep_devices)} esep")
         while untitled_devices and esep_devices:
             esep_device = esep_devices.pop(0)
             fit_device = min(untitled_devices, key=lambda x: distance(x, esep_device))
             pairs.append((fit_device, esep_device))
-            logger.info(
-                f"[PAIR BY VALUE] account={account_number} fit aca_dev={fit_device.get('device_number')} (val={fit_device.get('value')}) "
-                f"with esep_dev={esep_device.get('device_number')} (val={esep_device.get('value')}) "
-                f"dist={abs((fit_device.get('value') or 0) - (esep_device.get('value') or 0))}"
-            )
+            # logger.info(
+            #     f"[PAIR BY VALUE] account={account_number} fit aca_dev={fit_device.get('device_number')} (val={fit_device.get('value')}) "
+            #     f"with esep_dev={esep_device.get('device_number')} (val={esep_device.get('value')}) "
+            #     f"dist={abs((fit_device.get('value') or 0) - (esep_device.get('value') or 0))}"
+            # )
             untitled_devices.remove(fit_device)
 
         # хвосты в отчёты
         for device in esep_devices:
-            logger.info(f"[PAIR TAIL ESEP] account={account_number} not_matched_esep={device['device_number']}")
+            # logger.info(f"[PAIR TAIL ESEP] account={account_number} not_matched_esep={device['device_number']}")
             reports_data[ReportTypes.IN_ESEP_NOT_IN_VODOKANAL].append((account_number, device['device_number']))
 
         for device in untitled_devices:
-            logger.info(f"[PAIR TAIL ACA] account={account_number} not_matched_aca={device.get('device_number')}")
+            # logger.info(f"[PAIR TAIL ACA] account={account_number} not_matched_aca={device.get('device_number')}")
             reports_data[ReportTypes.IN_VODOKANAL_NOT_IN_ESEP].append(device)
 
     return pairs, reports_data
@@ -870,7 +868,7 @@ def check_source(source):
 
 def read_accounts_csv_file(file_path) -> list:
     """ Returns list of account_number strings """
-    print("file_path: ", file_path)
+    # print("file_path: ", file_path)
 
     accounts = []
     try:
@@ -879,7 +877,7 @@ def read_accounts_csv_file(file_path) -> list:
             raw_data = f.read()
             detected_encoding = chardet.detect(raw_data)['encoding']
 
-        print('encoding: ', detected_encoding)
+        # /
         with open(file_path, 'r', encoding=detected_encoding) as file:
             reader = csv.reader(file, delimiter=';')
             for i, row in enumerate(reader):
@@ -1010,12 +1008,12 @@ def update_kok_db_task(self, update_obj_pk: int, account_numbers: list = None):
 
             for rca in account_numbers:
                 url = f"http://suarnasik.hopto.org:4444/abon/hs/upr/people?rca={str(rca).strip()}"
-                logger.info(f"[KOK] GET {url}")
+                # logger.info(f"[KOK] GET {url}")
                 try:
                     start_ts = datetime.now()
                     resp = requests.get(url, headers=headers, timeout=10)
                     latency_ms = int((datetime.now() - start_ts).total_seconds() * 1000)
-                    logger.info(f"[KOK API] rca={rca} http={resp.status_code} latency_ms={latency_ms} len={len(resp.content) if resp.content else 0}")
+                    # logger.info(f"[KOK API] rca={rca} http={resp.status_code} latency_ms={latency_ms} len={len(resp.content) if resp.content else 0}")
 
                     if resp.status_code != 200:
                         if resp.status_code == 404:

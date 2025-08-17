@@ -3,6 +3,7 @@ stages:
   - deploy
 
 variables:
+  GIT_STRATEGY: "fetch"
   DJANGO_SETTINGS_MODULE: config.settings
   MYSQL_HOST: db
   MYSQL_DATABASE: updaterninja
@@ -15,19 +16,34 @@ variables:
   ESEP_DB_USER: sultan_a
   ESEP_DB_PASSWORD: 'L$xUQyBQ'
   ESEP_DB_NAME: esep
-  GIT_STRATEGY: clone
-  PYTHONDONTWRITEBYTECODE: 1
-  PYTHONUNBUFFERED: 1
+  PYTHONDONTWRITEBYTECODE: "1"
+  PYTHONUNBUFFERED: "1"
 
 build-job:
   stage: build
-  tags:
-    - esep-ninja
+  tags: [esep-ninja]
   before_script:
-    - git config --global --add safe.directory $CI_PROJECT_DIR
+    - git config --global --add safe.directory "$CI_PROJECT_DIR"
+    - find "$CI_PROJECT_DIR" -type d -name "__pycache__" -prune -exec rm -rf {} + || true
+    - git rev-parse HEAD
   script:
     - echo "Generating .env.dev..."
-    - echo "Building Docker containers..."
+    - |
+      cat > .env.dev <<'EOF'
+      DJANGO_SETTINGS_MODULE=${DJANGO_SETTINGS_MODULE}
+      MYSQL_HOST=${MYSQL_HOST}
+      MYSQL_DATABASE=${MYSQL_DATABASE}
+      MYSQL_ROOT_PASSWORD=${MYSQL_ROOT_PASSWORD}
+      PMA_HOST=${PMA_HOST}
+      PMA_USER=${PMA_USER}
+      PMA_PASSWORD=${PMA_PASSWORD}
+      UPLOAD_LIMIT=${UPLOAD_LIMIT}
+      ESEP_DB_HOST=${ESEP_DB_HOST}
+      ESEP_DB_USER=${ESEP_DB_USER}
+      ESEP_DB_PASSWORD=${ESEP_DB_PASSWORD}
+      ESEP_DB_NAME=${ESEP_DB_NAME}
+      EOF
+    - echo "Building Docker images..."
     - docker-compose -f docker-compose.yml build
   artifacts:
     paths:
@@ -36,18 +52,25 @@ build-job:
 
 deploy-job:
   stage: deploy
-  tags:
-    - esep-ninja
-  dependencies:
-    - build-job
+  tags: [esep-ninja]
+  needs: ["build-job"]
+  dependencies: ["build-job"]
+  before_script:
+    - git config --global --add safe.directory "$CI_PROJECT_DIR"
+    - find "$CI_PROJECT_DIR" -type d -name "__pycache__" -prune -exec rm -rf {} + || true
+    - git rev-parse HEAD
+    - ls -la
   script:
+    # Дадим docker-compose корректный env: либо переименуем,
+    # либо используем --env-file (раскомментируй один из вариантов).
+    - mv -f .env.dev .env
+    # - export COMPOSE_DOCKER_CLI_BUILD=1   # (опционально) ускорение сборки
     - echo "Stopping existing containers..."
-    # - cd /home/bekzhan.s/esep_updater_ninja/
-    # - docker-compose -f docker-compose.yml down --remove-orphans || true
-    # - echo "Starting updated containers..."
-    - docker-compose -f docker-compose.yml up -d
+    - docker-compose -f docker-compose.yml down --remove-orphans || true
+    - echo "Building & starting updated containers..."
+    - docker-compose -f docker-compose.yml up -d --build --force-recreate
     - echo "Checking container status..."
-    # - docker ps | grep esep || echo "No containers found"
+    - docker ps --format "table {{.Names}}\t{{.Image}}\t{{.Status}}"
   only:
     - main
     - develop
