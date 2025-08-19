@@ -6,7 +6,7 @@ import requests
 import mysql.connector
 from datetime import datetime, timedelta, date
 from constance import config
-from django.db import OperationalError
+from django.db import OperationalError, close_old_connections
 from django.utils import timezone
 from apps.common import UpdatingTypes, ReportTypes, UpdateStatuses
 from apps.common.models import UpdateHistory, UpdateHistoryReport, UpdateHistoryRollback
@@ -39,6 +39,16 @@ def _diff_dict(before: dict, after: dict) -> List[Dict[str, str]]:
         if old_val != new_val:
             changes.append({"field": k, "old": _s(old_val), "new": _s(new_val)})
     return changes
+
+
+def _same_values(before: dict, after: dict) -> bool:
+    """Return True if all keys in ``after`` have the same value in ``before``."""
+    if not after:
+        return True
+    for k, v in after.items():
+        if before.get(k) != v:
+            return False
+    return True
 
 
 # ==========
@@ -104,6 +114,7 @@ def update_outdated_esep_devices_periodic_task():
 
 @cel_app.task(bind=True, max_retries=5)
 def update_esep_db_task(self, update_obj_pk: int, account_numbers: list = None):
+    close_old_connections()
     update_instance = UpdateHistory.objects.filter(pk=update_obj_pk).first()
     if not update_instance:
         raise self.retry(exc=OperationalError("Instance not found"))
@@ -226,6 +237,7 @@ def update_esep_db_task(self, update_obj_pk: int, account_numbers: list = None):
         update_instance.status_reason = msg
 
     finally:
+        close_old_connections()
         update_instance.completed_at = timezone.now()
         update_instance.save()
 
@@ -390,20 +402,26 @@ def synchronize_esep_db_with_aca_data(
                            d.comment, d.updated_by, d.updated_at,
                            i.deleted_at
                       FROM devices d
-                 LEFT JOIN indications i ON d.id = i.device_id
-                 INNER JOIN bank_books b ON b.id = d.bankbook_id
+                      JOIN bank_books b ON b.id = d.bankbook_id
+                 LEFT JOIN (
+                        SELECT x.device_id,
+                               x.updated_at,
+                               x.id
+                          FROM indications x
+                          JOIN (
+                               SELECT device_id, MAX(updated_at) AS mu
+                                 FROM indications
+                                GROUP BY device_id
+                          ) m ON m.device_id = x.device_id AND m.mu = x.updated_at
+                 ) last ON last.device_id = d.id
+                 LEFT JOIN indications i
+                        ON i.device_id = last.device_id
+                       AND i.updated_at = last.updated_at
+                       AND i.id         = last.id
                      WHERE b.number = %s
                        AND b.company_id = %s
                        AND d.company_id = %s
                        AND d.deleted_at IS NULL
-                       AND (
-                            i.id = (SELECT i2.id
-                                      FROM indications i2
-                                     WHERE i2.device_id = d.id
-                                  ORDER BY i2.updated_at DESC, i2.id DESC
-                                     LIMIT 1)
-                            OR i.id IS NULL
-                       )
                 """, (account_id, bb_company_id, bb_company_id))
                 esep_db_data = cursor.fetchall()
 
@@ -527,11 +545,12 @@ def synchronize_esep_db_with_aca_data(
                             "changes": changes,
                         })
 
-                    set_clause = ",".join(f"`{k}` = %s" for k in params_dict['keys'])
-                    cursor.execute(
-                        f"UPDATE devices SET {set_clause}, comment = %s, updated_by = 693, updated_at = NOW() WHERE id = %s",
-                        (*params_dict['values'], f"ninja_update {str(update_obj_pk)}", esep_device['id'])
-                    )
+                    if not _same_values(before_dev, after_dev):
+                        set_clause = ",".join(f"`{k}` = %s" for k in params_dict['keys'])
+                        cursor.execute(
+                            f"UPDATE devices SET {set_clause}, comment = %s, updated_by = 693, updated_at = NOW() WHERE id = %s",
+                            (*params_dict['values'], f"ninja_update {str(update_obj_pk)}", esep_device['id'])
+                        )
 
                     total_report_json['rollback_data']['update']['devices'].append((
                         esep_device['id'],
@@ -600,11 +619,12 @@ def synchronize_esep_db_with_aca_data(
                                 "changes": changes,
                             })
 
-                        set_clause = ",".join(f"`{k}` = %s" for k in params_dict['keys'])
-                        cursor.execute(
-                            f"UPDATE devices SET {set_clause}, comment = %s, updated_by = 693, updated_at = NOW() WHERE id = %s",
-                            (*params_dict['values'], f"ninja_update {str(update_obj_pk)}", dwi['id'])
-                        )
+                        if not _same_values(before_dev, after_dev):
+                            set_clause = ",".join(f"`{k}` = %s" for k in params_dict['keys'])
+                            cursor.execute(
+                                f"UPDATE devices SET {set_clause}, comment = %s, updated_by = 693, updated_at = NOW() WHERE id = %s",
+                                (*params_dict['values'], f"ninja_update {str(update_obj_pk)}", dwi['id'])
+                            )
 
                         total_report_json['rollback_data']['update']['devices'].append((
                             dwi['id'],
@@ -965,6 +985,7 @@ def _parse_kok_response_to_account_payload(json_obj: dict) -> dict:
 
 @cel_app.task(bind=True, max_retries=5)
 def update_kok_db_task(self, update_obj_pk: int, account_numbers: list = None):
+    close_old_connections()
     COMPANY_ID = 10
     update_instance = UpdateHistory.objects.filter(pk=update_obj_pk).first()
     if not update_instance:
@@ -1048,6 +1069,7 @@ def update_kok_db_task(self, update_obj_pk: int, account_numbers: list = None):
         update_instance.status = UpdateStatuses.FAILED
         update_instance.status_reason = msg
     finally:
+        close_old_connections()
         update_instance.completed_at = timezone.now()
         update_instance.save()
 
