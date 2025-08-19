@@ -7,7 +7,7 @@ import requests
 import mysql.connector
 from datetime import datetime, timedelta, date
 from constance import config
-from django.db import OperationalError
+from django.db import OperationalError, close_old_connections
 from django.utils import timezone
 
 from apps.common import UpdatingTypes, ReportTypes, UpdateStatuses
@@ -81,6 +81,7 @@ def update_outdated_esep_devices_periodic_task():
 
 @cel_app.task(bind=True, max_retries=5)
 def update_esep_db_task(self, update_obj_pk: int, account_numbers: list = None):
+    close_old_connections()
     print("Update instance: ", update_obj_pk)
     update_instance = UpdateHistory.objects.filter(pk=update_obj_pk).first()
     # print('update_instance: ', update_instance)
@@ -167,6 +168,7 @@ def update_esep_db_task(self, update_obj_pk: int, account_numbers: list = None):
         update_instance.status_reason = error_msg
 
     finally:
+        close_old_connections()
         update_instance.completed_at = timezone.now()
         update_instance.save()
 
@@ -244,6 +246,7 @@ def synchronize_esep_db_with_aca_data(aca_loaded_data, update_obj_pk: int):
             cursor.execute("select database();")
             record = cursor.fetchone()
             print("You're connected to database: ", record)
+            cursor.execute("SET SESSION TRANSACTION ISOLATION LEVEL READ COMMITTED")
 
     except mysql.connector.Error as e:
         logger.error(f"Error while connecting to MySQL: {str(e)}")
@@ -468,13 +471,18 @@ def synchronize_esep_db_with_aca_data(aca_loaded_data, update_obj_pk: int):
                     # total_report_json['rollback_data']['delete']['indications'].append(new_indication_id)
 
             # STORE REPORTS FROM account_number
-            total_report_json[ReportTypes.ZERO_IN_ACA_NOT_IN_ESEP].extend(account_report_data[ReportTypes.ZERO_IN_ACA_NOT_IN_ESEP])
-            total_report_json[ReportTypes.IN_ESEP_NOT_IN_ACA].extend(account_report_data[ReportTypes.IN_ESEP_NOT_IN_ACA])
+            total_report_json[ReportTypes.ZERO_IN_ACA_NOT_IN_ESEP].extend(
+                account_report_data[ReportTypes.ZERO_IN_ACA_NOT_IN_ESEP]
+            )
+            total_report_json[ReportTypes.IN_ESEP_NOT_IN_ACA].extend(
+                account_report_data[ReportTypes.IN_ESEP_NOT_IN_ACA]
+            )
             for d in account_report_data[ReportTypes.IN_ACA_NOT_IN_ESEP]:
-                total_report_json[ReportTypes.IN_ACA_NOT_IN_ESEP].append((aca_account_number, d['device_number']))
+                total_report_json[ReportTypes.IN_ACA_NOT_IN_ESEP].append(
+                    (aca_account_number, d['device_number'])
+                )
 
-        # SAVE ALL CHANGES INTO DATABASE
-        connection.commit()
+            connection.commit()
 
     except Exception as e:
         connection.rollback()
