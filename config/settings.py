@@ -84,14 +84,19 @@ print("Check")
 print("DB HOST:", os.environ.get("ESEP_DB_HOST"))
 print("DB USER:", os.environ.get("ESEP_DB_USER"))
 print("DB PASSWORD:", os.environ.get("ESEP_DB_PASSWORD"))
+print("DB HOST:", os.environ.get("ESEP_DB_PORT"))
+print("SQL PORT", os.environ.get("MYSQL_PORT"))
+print("SQL HOST", os.environ.get("MYSQL_HOST"))
+print("SQL USER", os.environ.get("MYSQL_USER"))
+print("SQL PASSWORD", os.environ.get("MYSQL_PASSWORD"))
 DATABASES = {
     'default': {
         'ENGINE': 'django.db.backends.mysql',
-        "NAME": os.getenv("MYSQL_DATABASE", "updaterninjadb"),
+        "NAME": os.getenv("MYSQL_DATABASE", "updaterninja"),
         "USER": os.getenv("MYSQL_USER", "root"),
-        "PASSWORD": os.getenv("MYSQL_ROOT_PASSWORD", ""),
-        "HOST": os.getenv("MYSQL_HOST", "db"),
-        "PORT": os.getenv("DB_PORT", "3306"),
+        "PASSWORD": os.getenv("MYSQL_ROOT_PASSWORD", "ninjapassword"),
+        "HOST": os.getenv("MYSQL_HOST", "127.0.0.1"),
+        "PORT": os.getenv("MYSQL_PORT", "3307"),
         'OPTIONS': {
             'init_command': "SET sql_mode='STRICT_TRANS_TABLES'"
         }
@@ -102,9 +107,10 @@ ESEP_DB_HOST = os.getenv("ESEP_DB_HOST")
 ESEP_DB_USER = os.getenv("ESEP_DB_USER")
 ESEP_DB_PASSWORD = os.getenv("ESEP_DB_PASSWORD")
 ESEP_DB_NAME = os.getenv("ESEP_DB_NAME")
+ESEP_DB_PORT = 54321
 
-REDIS_HOST = os.getenv("REDIS_HOST", "ninja-redis")
-REDIS_PORT = os.getenv("REDIS_PORT", "6379")
+REDIS_HOST = os.getenv("REDIS_HOST", "127.0.0.1")
+REDIS_PORT = os.getenv("REDIS_PORT", "6380")
 REDIS_DB_FOR_CELERY = os.getenv("REDIS_DB_FOR_CELERY", "0")
 REDIS_DB_FOR_CACHE = os.getenv("REDIS_DB_FOR_CACHE", "1")
 REDIS_AS_CACHE_URL = "redis://{host}:{port}/{db_index}".format(
@@ -133,7 +139,7 @@ CELERY_TASK_TRACK_STARTED = True
 
 CONSTANCE_BACKEND = 'constance.backends.database.DatabaseBackend'
 CONSTANCE_CONFIG = {
-    "ACA_SERVICE_HOST": ("https://88.204.161.86:4321", "Использовать код по умолчанию", str),
+    "ACA_SERVICE_HOST": ("https://agis.astanasu.kz:14321", "Использовать код по умолчанию", str),
     "ACA_SERVICE_API_KEY": ("", "Код по умолчанию", str),
     "OUTDATED_DEVICES_PERIOD": (100, "Период устаревших данных", int)
 }
@@ -169,6 +175,10 @@ AUTH_PASSWORD_VALIDATORS = [
         'NAME': 'django.contrib.auth.password_validation.NumericPasswordValidator',
     },
 ]
+
+KOKS_SERVICE_BASE_URL = "https://suarnasik.hopto.org:4444/abon/hs/upr/people"
+KOKS_REQUEST_TIMEOUT = 10
+KOKS_VERIFY_SSL = False  # если сертификат самоподписанный
 
 
 # Internationalization
