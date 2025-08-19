@@ -83,10 +83,6 @@ class UpdateHistory(TimestampModel):
         choices=UpdatingTypes.choices,
         default=UpdatingTypes.BY_API
     )
-    company_id = models.PositiveIntegerField("Компания", choices=[
-        (7, "ACA"),
-        (10, "Кокшетау"),
-    ], default=7)
     data_file = models.FileField(upload_to="data", null=True, blank=True)
     is_automatic = models.BooleanField(default=False)
     status = models.CharField(
@@ -103,224 +99,106 @@ class UpdateHistory(TimestampModel):
         verbose_name_plural = "История Обновлений"
 
     def run_rollback(self):
-        rb = getattr(self, "rollback", None)
-        if not rb or not rb.data_json:
-            logger.warning(f"[ROLLBACK] upd={self.pk}: rollback payload is empty — nothing to do")
-            return
+        if getattr(self, 'rollback'):
+            data = self.rollback.data_json
 
-        data = rb.data_json or {}
-        logger.info(f"[ROLLBACK] start upd={self.pk}")
+            try:
+                connection = get_connection_to_esep_db()
+                if connection.is_connected():
+                    cursor = connection.cursor(buffered=True)
+                    cursor.execute("select database();")
+                    record = cursor.fetchone()
+                    print("You're connected to database: ", record)
 
-        conn = None
-        cur = None
-        try:
-            conn = get_connection_to_esep_db()
-            conn.autocommit = False
-            cur = conn.cursor(buffered=True)
-            cur.execute("SELECT DATABASE()")
-            db = cur.fetchone()
-            logger.warning("You're connected to database: ")
-            logger.warning(db)
+            except mysql.connector.Error as e:
+                logger.error(f"Error while connecting to MySQL: {str(e)}")
+                raise Exception(f"Error while connecting to MySQL: {str(e)}")
 
-            # ===== 1) bank_books: вернуть phone/name/people =====
-            bank_books = data.get("bank_books") or []
-            for i, row in enumerate(bank_books, start=1):
-                try:
-                    if isinstance(row, (list, tuple)) and len(row) >= 4:
-                        bankbook_id = row[0]
-                        phone_old = row[1]
-                        name_old = row[2]
-                        people_old = row[3]
-                    elif isinstance(row, dict):
-                        bankbook_id = row.get("id")
-                        phone_old = row.get("phone")
-                        name_old = row.get("name")
-                        people_old = row.get("people")
-                    else:
-                        logger.warning(f"[ROLLBACK][BANK_BOOKS] skip malformed item #{i}: {row}")
-                        continue
+            if len(data.get('create', {}).get('devices', [])) > 0:
+                cursor.executemany(f"""
+                    INSERT INTO devices 
+                        ({", ".join(devices_columns)})
+                    VALUES 
+                        ({', '.join(['%s'] * len(devices_columns))})
+                """, data['create']['devices'])
 
-                    logger.info(
-                        f"[ROLLBACK][BANK_BOOK] id={bankbook_id}: phone='{phone_old}', name='{name_old}', people={people_old}")
-                    cur.execute(
-                        """
-                        UPDATE bank_books
-                           SET phone=%s,
-                               name=%s,
-                               people=%s,
-                               updated_by=%s,
-                               updated_at=NOW()
-                         WHERE id=%s
-                        """,
-                        (phone_old, name_old, people_old, 693, bankbook_id)
-                    )
-                except Exception as e:
-                    logger.error(f"[ROLLBACK][BANK_BOOK] error on item #{i}: {e}")
-                    raise
+            if len(data.get('reset_deletion', {}).get('devices', [])) > 0:
+                cursor.execute(f"""
+                    UPDATE devices SET deleted_by=NULL, deleted_at=NULL, updated_at=now(), comment='ninja_update_rollback {str(self.id)}' 
+                    WHERE id IN ({', '.join(['%s'] * len(data['reset_deletion']['devices']))})
+                """, data['reset_deletion']['devices'])
 
-            # ===== 2) reset_deletion: оживить всё, что было помечено на удаление =====
-            reset = (data.get("reset_deletion") or {})
-            reset_dev_ids = list(reset.get("devices") or [])
-            reset_ind_ids = list(reset.get("indications") or [])
-
-            if reset_dev_ids:
-                logger.info(f"[ROLLBACK][RESET DELETION] devices: {reset_dev_ids}")
-                q = ", ".join(["%s"] * len(reset_dev_ids))
-                cur.execute(
-                    f"UPDATE devices SET deleted_at=NULL, deleted_by=NULL, updated_by=%s, updated_at=NOW(), comment=%s WHERE id IN ({q})",
-                    (693, f"ninja_update_rollback {self.id}", *reset_dev_ids)
-                )
-
-            if reset_ind_ids:
-                logger.info(f"[ROLLBACK][RESET DELETION] indications: {reset_ind_ids}")
-                q = ", ".join(["%s"] * len(reset_ind_ids))
-                cur.execute(
-                    f"UPDATE indications SET deleted_at=NULL, deleted_by=NULL, updated_at=NOW() WHERE id IN ({q})",
-                    (*reset_ind_ids,)
-                )
-
-            # ===== 3) удалить записи, созданные обновлением (delete.*) =====
-            to_delete = (data.get("delete") or {})
-            del_ind_ids = list(to_delete.get("indications") or [])
-            del_dev_ids = list(to_delete.get("devices") or [])
-
-            if del_ind_ids:
-                logger.info(f"[ROLLBACK][DELETE] indications: {del_ind_ids}")
-                q = ", ".join(["%s"] * len(del_ind_ids))
-                cur.execute(f"DELETE FROM indications WHERE id IN ({q})", (*del_ind_ids,))
-
-            if del_dev_ids:
-                logger.info(f"[ROLLBACK][DELETE] devices: {del_dev_ids}")
-                q = ", ".join(["%s"] * len(del_dev_ids))
-                cur.execute(f"DELETE FROM devices WHERE id IN ({q})", (*del_dev_ids,))
-
-            # ===== 4) откатить апдейты устройств (update.devices) =====
-            upd = (data.get("update") or {})
-            upd_devices = upd.get("devices") or []
-
-            if upd_devices:
-                sample = upd_devices[0]
-                # Поддержка legacy/расширенных форматов:
-                # len==7:  (id, last_check, next_check, modem_number, name_ru, name_kk, name_en)
-                # len==11: (id, last_check, next_check, modem_number, name_ru, name_kk, name_en, number, comment, updated_by, 'now()')
-                # else:    (id, last_check, next_check, modem_number, name_ru, name_kk, name_en, resource_type_id, number, comment, updated_by, 'now()')
-                if isinstance(sample, (list, tuple)) and len(sample) == 7:
-                    # минимальный набор
-                    cur.executemany(
-                        """
-                        UPDATE devices
-                           SET last_check=%s,
-                               next_check=%s,
-                               modem_number=%s,
-                               name_ru=%s,
-                               name_kk=%s,
-                               name_en=%s,
-                               updated_by=%s,
-                               updated_at=NOW()
-                         WHERE id=%s
-                        """,
-                        [
-                            (row[1], row[2], row[3], row[4], row[5], row[6], 693, row[0])
-                            for row in upd_devices
-                        ]
-                    )
-                elif isinstance(sample, (list, tuple)) and len(sample) == 11:
-                    # без resource_type_id
-                    cleaned = [row[:-1] for row in upd_devices]  # убираем 'now()' в конце
-                    cur.executemany(
-                        """
-                        UPDATE devices
-                           SET last_check=%s,
-                               next_check=%s,
-                               modem_number=%s,
-                               name_ru=%s,
-                               name_kk=%s,
-                               name_en=%s,
-                               number=%s,
-                               comment=%s,
-                               updated_by=%s,
-                               updated_at=NOW()
-                         WHERE id=%s
-                        """,
-                        [
-                            (row[1], row[2], row[3], row[4], row[5], row[6],
-                             row[7], row[8], row[9], row[0])
-                            for row in cleaned
-                        ]
-                    )
+            if len(data.get('update', {}).get('devices', [])) > 0:
+                if len(data['update']['devices'][0]) == 7:  # legacy
+                    values_placeholders = "(%s, %s, %s, %s, %s, %s, %s)"
+                    columns_placeholders = "(id, last_check, next_check, modem_number, name_ru, name_kk, name_en)"
+                    columns_update = ""
+                    data_update_devices = data['update']['devices']
+                elif len(data['update']['devices'][0]) == 11:
+                    values_placeholders = "(%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)"
+                    columns_placeholders = ("(id, last_check, next_check, modem_number, name_ru, name_kk, name_en, "
+                                            "number, comment, updated_by)")
+                    columns_update = """number = VALUES(number),
+                        comment = VALUES(comment),
+                        updated_by = VALUES(updated_by),
+                        updated_at = NOW()
+                    """
+                    data_update_devices = [device[:-1] for device in data['update']['devices']]
                 else:
-                    # полный набор c resource_type_id
-                    cleaned = [row[:-1] if isinstance(row, (list, tuple)) else row for row in upd_devices]
-                    cur.executemany(
-                        """
-                        UPDATE devices
-                           SET last_check=%s,
-                               next_check=%s,
-                               modem_number=%s,
-                               name_ru=%s,
-                               name_kk=%s,
-                               name_en=%s,
-                               resource_type_id=%s,
-                               number=%s,
-                               comment=%s,
-                               updated_by=%s,
-                               updated_at=NOW()
-                         WHERE id=%s
-                        """,
-                        [
-                            (row[1], row[2], row[3], row[4], row[5], row[6],
-                             row[7], row[8], row[9], row[10], row[0])
-                            for row in cleaned
-                        ]
-                    )
+                    values_placeholders = "(%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)"
+                    columns_placeholders = ("(id, last_check, next_check, modem_number, name_ru, name_kk, name_en, "
+                                            "resource_type_id, number, comment, updated_by)")
+                    columns_update = """resource_type_id = VALUES(resource_type_id),
+                        number = VALUES(number),
+                        comment = VALUES(comment),
+                        updated_by = VALUES(updated_by),
+                        updated_at = NOW()
+                    """
+                    data_update_devices = [device[:-1] for device in data['update']['devices']]
 
-            # ===== 5) откатить апдейты показаний (update.indications) =====
-            upd_inds = upd.get("indications") or []
-            if upd_inds:
-                cur.executemany(
-                    "UPDATE indications SET value=%s, updated_at=NOW() WHERE id=%s",
-                    [
-                        (row[1], row[0]) if isinstance(row, (list, tuple)) else (row.get("value"), row.get("id"))
-                        for row in upd_inds
-                    ]
-                )
+                cursor.executemany(f"""
+                    INSERT INTO devices 
+                        {columns_placeholders}
+                    VALUES 
+                        {values_placeholders} 
+                    ON DUPLICATE KEY UPDATE 
+                        modem_number = VALUES(modem_number),
+                        name_ru = VALUES(name_ru),
+                        name_kk = VALUES(name_kk),
+                        name_en = VALUES(name_en),
+                        last_check = VALUES(last_check),
+                        next_check = VALUES(next_check),
+                        {columns_update}
+                """, data_update_devices)
 
-            # ===== 6) пересоздать записи, если есть слепки в create.devices =====
-            create = (data.get("create") or {})
-            create_devices = create.get("devices") or []
-            if create_devices:
-                logger.info(f"[ROLLBACK][REINSERT DEVICES] count={len(create_devices)}")
-                cols = (
-                    "id, company_id, resource_type_id, bankbook_id, number, uid, area_type, "
-                    "name_ru, name_kk, name_en, manufacturer, manufacture_date, diameter, "
-                    "modem_number, last_check, next_check, seal_number, seal_setting_date, "
-                    "anti_magnetic_seal_number, anti_magnetic_seal_setting_date, ast_su_ind, "
-                    "comment, created_by, updated_by, deleted_by, created_at, updated_at, deleted_at"
-                )
-                placeholders = ", ".join(["%s"] * 29)
-                cur.executemany(
-                    f"INSERT INTO devices ({cols}) VALUES ({placeholders})",
-                    create_devices
-                )
+            if len(data.get('update', {}).get('indications', [])) > 0:
+                cursor.executemany("""
+                    INSERT INTO indications 
+                        (id, value)
+                    VALUES 
+                        (%s, %s) 
+                    ON DUPLICATE KEY UPDATE 
+                        value = VALUES(value)
+                """, data['update']['indications'])
 
-            # commit
-            conn.commit()
-            logger.info(f"[ROLLBACK] success upd={self.pk}")
+            if len(data.get('delete', {}).get('devices', [])) > 0:
+                placeholders = ', '.join(['%s'] * len(data['delete']['devices']))
+                sql_query = f"DELETE FROM devices WHERE id IN ({placeholders})"
+                cursor.execute(sql_query, data['delete']['devices'])
 
-        except Exception as e:
-            logger.error(f"[ROLLBACK] error upd={self.pk}: {e}")
-            if conn:
-                conn.rollback()
-            raise
-        finally:
-            if cur:
-                cur.close()
-            if conn:
-                conn.close()
+            if len(data.get('delete', {}).get('indications', [])) > 0:
+                placeholders = ', '.join(['%s'] * len(data['delete']['indications']))
+                sql_query = f"DELETE FROM indications WHERE id IN ({placeholders})"
+                cursor.execute(sql_query, data['delete']['indications'])
 
-        self.status = UpdateStatuses.ROLLED_BACK
-        self.rolled_back_at = timezone.now()
-        self.save()
+            connection.commit()
+            if connection.is_connected():
+                cursor.close()
+                connection.close()
+
+            self.status = UpdateStatuses.ROLLED_BACK
+            self.rolled_back_at = timezone.now()
+            self.save()
 
 
 class UpdateHistoryReport(TimestampModel):
@@ -331,9 +209,9 @@ class UpdateHistoryReport(TimestampModel):
         null=True, blank=True
     )
     report_type = models.CharField(
-        max_length=100,
+        max_length=30,
         choices=ReportTypes.choices,
-        default=ReportTypes.IN_VODOKANAL_NOT_IN_ESEP
+        default=ReportTypes.IN_ACA_NOT_IN_ESEP
     )
     data_json = models.JSONField(null=True, blank=True)
 

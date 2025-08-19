@@ -7,7 +7,5 @@ def get_connection_to_esep_db():
         host=settings.ESEP_DB_HOST,
         user=settings.ESEP_DB_USER,
         password=settings.ESEP_DB_PASSWORD,
-        database=settings.ESEP_DB_NAME,
-        connection_timeout=60,  # ждём до 60 секунд при handshake :contentReference[oaicite:1]{index=1}
-        autocommit=True
+        database=settings.ESEP_DB_NAME
     )
