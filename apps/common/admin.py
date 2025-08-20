@@ -18,8 +18,8 @@ from apps.common.tasks import (
     run_rollback_task,
 )
 
-admin.site.site_header = "Updater Ninja Project"
-admin.site.site_title = "Updater Ninja Project"
+admin.site.site_header = "Updater Ninja Project1"
+admin.site.site_title = "Updater Ninja Project1"
 admin.site.index_title = ""
 
 
