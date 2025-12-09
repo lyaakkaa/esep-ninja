@@ -340,6 +340,8 @@ def synchronize_esep_db_with_aca_data(
             cursor.execute("SET SESSION TRANSACTION ISOLATION LEVEL READ COMMITTED")
             cursor.execute("SET SESSION innodb_lock_wait_timeout = %s", (60,))
 
+            connection.start_transaction()
+
             cursor.execute("SELECT DATABASE();")
             _ = cursor.fetchone()
 

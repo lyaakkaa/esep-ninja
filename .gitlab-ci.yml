@@ -1,35 +1,28 @@
-stages:
-  - build
-  - deploy
+stages: [build, deploy]
 
 variables:
-  GIT_STRATEGY: "fetch"
-  DJANGO_SETTINGS_MODULE: config.settings
-  MYSQL_HOST: db
-  MYSQL_DATABASE: updaterninja
-  MYSQL_ROOT_PASSWORD: ninjapassword
-  PMA_HOST: db
-  PMA_USER: root
-  PMA_PASSWORD: ninjapassword
-  UPLOAD_LIMIT: 300M
-  ESEP_DB_HOST: 192.168.1.17
-  ESEP_DB_USER: sultan_a
-  ESEP_DB_PASSWORD: 'L$xUQyBQ'
-  ESEP_DB_NAME: esep
-  PYTHONDONTWRITEBYTECODE: "1"
-  PYTHONUNBUFFERED: "1"
+  GIT_STRATEGY: "none"   # <-- GitLab НЕ будет делать checkout сам
+
+.common_setup: &common_setup
+  - sudo chown -R gitlab-runner:gitlab-runner "$CI_PROJECT_DIR" || true
+  - sudo find "$CI_PROJECT_DIR" -type d -name "__pycache__" -exec rm -rf {} + || true
+  - sudo rm -rf "$CI_PROJECT_DIR/media" || true
+  # Ручной checkout именно того коммита, который запускает пайплайн
+  - git -C "$CI_PROJECT_DIR" init || true
+  - git -C "$CI_PROJECT_DIR" remote remove origin 2>/dev/null || true
+  - git -C "$CI_PROJECT_DIR" remote add origin "$CI_REPOSITORY_URL"
+  - git -C "$CI_PROJECT_DIR" fetch --depth=1 origin "$CI_COMMIT_SHA"
+  - git -C "$CI_PROJECT_DIR" reset --hard "$CI_COMMIT_SHA"
+  - git -C "$CI_PROJECT_DIR" clean -ffdx
 
 build-job:
   stage: build
   tags: [esep-ninja]
   before_script:
-    - git config --global --add safe.directory "$CI_PROJECT_DIR"
-    - find "$CI_PROJECT_DIR" -type d -name "__pycache__" -prune -exec rm -rf {} + || true
-    - git rev-parse HEAD
+    - *common_setup
   script:
-    - echo "Generating .env.dev..."
     - |
-      cat > .env.dev <<'EOF'
+      cat > .env <<EOF
       DJANGO_SETTINGS_MODULE=${DJANGO_SETTINGS_MODULE}
       MYSQL_HOST=${MYSQL_HOST}
       MYSQL_DATABASE=${MYSQL_DATABASE}
@@ -43,11 +36,9 @@ build-job:
       ESEP_DB_PASSWORD=${ESEP_DB_PASSWORD}
       ESEP_DB_NAME=${ESEP_DB_NAME}
       EOF
-    - echo "Building Docker images..."
-    - docker-compose -f docker-compose.yml build
+    - docker-compose -f docker-compose.yml build --pull
   artifacts:
-    paths:
-      - .env.dev
+    paths: [.env]
     expire_in: 1 hour
 
 deploy-job:
@@ -56,21 +47,9 @@ deploy-job:
   needs: ["build-job"]
   dependencies: ["build-job"]
   before_script:
-    - git config --global --add safe.directory "$CI_PROJECT_DIR"
-    - find "$CI_PROJECT_DIR" -type d -name "__pycache__" -prune -exec rm -rf {} + || true
-    - git rev-parse HEAD
-    - ls -la
+    - *common_setup
   script:
-    # Дадим docker-compose корректный env: либо переименуем,
-    # либо используем --env-file (раскомментируй один из вариантов).
-    - mv -f .env.dev .env
-    # - export COMPOSE_DOCKER_CLI_BUILD=1   # (опционально) ускорение сборки
-    - echo "Stopping existing containers..."
     - docker-compose -f docker-compose.yml down --remove-orphans || true
-    - echo "Building & starting updated containers..."
-    - docker-compose -f docker-compose.yml up -d --build --force-recreate
-    - echo "Checking container status..."
-    - docker ps --format "table {{.Names}}\t{{.Image}}\t{{.Status}}"
-  only:
-    - main
-    - develop
+    - docker-compose -f docker-compose.yml up -d --build --force-recreate --remove-orphans
+    - docker ps | grep -E 'esep|ninja' || echo "No containers found"
+  only: [main, develop]
