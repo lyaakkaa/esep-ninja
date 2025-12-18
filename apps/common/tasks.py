@@ -115,6 +115,11 @@ def update_outdated_esep_devices_periodic_task():
 @cel_app.task(bind=True, max_retries=5)
 def update_esep_db_task(self, update_obj_pk: int, account_numbers: list = None):
     close_old_connections()
+    logger.info(
+        "[update_esep_db_task] Start update: pk=%s, account_numbers_provided=%s",
+        update_obj_pk,
+        bool(account_numbers),
+    )
     update_instance = UpdateHistory.objects.filter(pk=update_obj_pk).first()
     if not update_instance:
         raise self.retry(exc=OperationalError("Instance not found"))
@@ -124,7 +129,18 @@ def update_esep_db_task(self, update_obj_pk: int, account_numbers: list = None):
 
         if update_instance.updating_type == UpdatingTypes.BY_API:
             if not account_numbers:
+                if not update_instance.data_file:
+                    raise ValueError("Не передан список ЛС и не загружен файл с ЛС для BY_API обновления")
                 account_numbers = read_accounts_csv_file(update_instance.data_file.path)
+                if not account_numbers:
+                    raise ValueError("В файле ЛС не найдено ни одной валидной строки для BY_API обновления")
+
+            logger.info(
+                "[update_esep_db_task] BY_API mode. Accounts to update: %s. Automatic=%s. File=%s",
+                len(account_numbers),
+                update_instance.is_automatic,
+                update_instance.data_file.path if update_instance.data_file else None,
+            )
 
             accounts_data: Dict[str, Dict[str, Any]] = {}
             empty_accounts: List[str] = []
@@ -142,7 +158,11 @@ def update_esep_db_task(self, update_obj_pk: int, account_numbers: list = None):
                 try:
                     response = requests.get(api_url, verify=False, timeout=10)
                 except requests.exceptions.RequestException as req_err:
-                    logger.error(f"ACA API request error: {req_err}")
+                    logger.error(
+                        "[update_esep_db_task] ACA request error for account=%s: %s",
+                        account_number,
+                        req_err,
+                    )
                     continue
 
                 if response.status_code != 200:
@@ -150,6 +170,12 @@ def update_esep_db_task(self, update_obj_pk: int, account_numbers: list = None):
                     if response.status_code == 404:
                         empty_accounts.append(account_number)
                     else:
+                        logger.warning(
+                            "[update_esep_db_task] ACA non-200 response %s for account=%s: %s",
+                            response.status_code,
+                            account_number,
+                            response.text[:200],
+                        )
                         # возможно wrong apikey в JSON
                         try:
                             error_data = response.json()
@@ -161,13 +187,17 @@ def update_esep_db_task(self, update_obj_pk: int, account_numbers: list = None):
 
                 # ожидаем JSON
                 if not (response.headers.get('Content-Type') or '').startswith('application/json'):
-                    logger.error(f"Unexpected Content-Type from ACA: {response.headers.get('Content-Type')}")
+                    logger.error(
+                        "[update_esep_db_task] Unexpected Content-Type from ACA for account=%s: %s",
+                        account_number,
+                        response.headers.get('Content-Type'),
+                    )
                     continue
 
                 try:
                     account_data = response.json()
                 except ValueError:
-                    logger.error("ACA API returned invalid JSON")
+                    logger.error("[update_esep_db_task] ACA API returned invalid JSON for account=%s", account_number)
                     continue
 
                 # нет счётчиков — фиксируем пустые
@@ -198,6 +228,12 @@ def update_esep_db_task(self, update_obj_pk: int, account_numbers: list = None):
                     "phone": phone_from_api
                 }
 
+            logger.info(
+                "[update_esep_db_task] ACA fetch finished: requested=%s, got_data=%s, empty_accounts=%s",
+                len(account_numbers),
+                len(accounts_data),
+                len(empty_accounts),
+            )
             # синхронизация (название функции историческое)
             total_report_json = synchronize_esep_db_with_aca_data(accounts_data, update_obj_pk, company_id=update_instance.company_id)
             total_report_json[ReportTypes.EMPTY_BODY_FROM_VODOKANAL_API] = empty_accounts
@@ -227,10 +263,15 @@ def update_esep_db_task(self, update_obj_pk: int, account_numbers: list = None):
             ])
 
         update_instance.status = UpdateStatuses.SUCCESS
+        logger.info(
+            "[update_esep_db_task] Update finished successfully: pk=%s, reports=%s",
+            update_obj_pk,
+            list(total_report_json.keys()) if total_report_json else [],
+        )
 
     except Exception as e:
         msg = str(e)
-        logger.error(msg)
+        logger.exception("[update_esep_db_task] Failed update pk=%s: %s", update_obj_pk, msg)
         update_instance.status = UpdateStatuses.FAILED
         if "HTTPSConnectionPool" in msg:
             msg = "Не доходит запрос до АСА API сервиса: " + msg
@@ -240,6 +281,7 @@ def update_esep_db_task(self, update_obj_pk: int, account_numbers: list = None):
         close_old_connections()
         update_instance.completed_at = timezone.now()
         update_instance.save()
+        logger.info("[update_esep_db_task] Update finalized: pk=%s, status=%s", update_obj_pk, update_instance.status)
 
 
 def get_params_for_update(aca_device, current_next_check=None):
@@ -335,6 +377,13 @@ def synchronize_esep_db_with_aca_data(
                 raise Exception("DB not connected")
             cursor = connection.cursor(buffered=True)
             connection.autocommit = False
+
+            logger.debug(
+                "[sync] Attempt %s/%s: connected to DB '%s'",
+                attempt,
+                MAX_RETRIES,
+                getattr(connection, "database", "unknown"),
+            )
 
             # важные сессионные настройки против блокировок
             cursor.execute("SET SESSION TRANSACTION ISOLATION LEVEL READ COMMITTED")
@@ -751,6 +800,7 @@ def synchronize_esep_db_with_aca_data(
 
             # commit
             connection.commit()
+            logger.info("[sync] Commit success on attempt %s/%s", attempt, MAX_RETRIES)
             break  # успех, выходим из retry-цикла
 
         except mysql.connector.Error as e:
@@ -763,11 +813,11 @@ def synchronize_esep_db_with_aca_data(
 
             # Deadlock (1213) / Lock wait timeout (1205): аккуратно повторим  # <<< CHANGE
             if getattr(e, "errno", None) in (1205, 1213) and attempt < MAX_RETRIES:
-                logger.warning(f"Transaction retry {attempt}/{MAX_RETRIES} after MySQL error {e.errno}: {e}")
+                logger.warning("Transaction retry %s/%s after MySQL error %s: %s", attempt, MAX_RETRIES, e.errno, e)
                 time.sleep(backoff)
                 backoff *= 2
                 continue
-            logger.error(f"SYNC error (no retry), rolled back: {e}")
+            logger.exception("SYNC error (no retry), rolled back: %s", e)
             raise
         except Exception as e:
             try:
@@ -775,7 +825,7 @@ def synchronize_esep_db_with_aca_data(
                     connection.rollback()
             except Exception:
                 pass
-            logger.error(f"SYNC error, rolled back: {e}")
+            logger.exception("SYNC error, rolled back: %s", e)
             raise
         finally:
             try:
@@ -866,12 +916,14 @@ def check_source(source):
 def read_accounts_csv_file(file_path) -> list:
     """Возвращает список строк-ЛС. Валидирует, что ЛС — число; иначе warning и пропуск."""
     accounts: List[str] = []
+    skipped = 0
+    detected_encoding = 'utf-8'
     try:
-        detected_encoding = 'utf-8'
         with open(file_path, 'rb') as f:
             raw_data = f.read()
             detected_encoding = chardet.detect(raw_data)['encoding'] or 'utf-8'
 
+        logger.info("[read_accounts_csv_file] %s detected encoding=%s", file_path, detected_encoding)
         with open(file_path, 'r', encoding=detected_encoding) as file:
             reader = csv.reader(file, delimiter=';')
             for i, row in enumerate(reader):
@@ -880,6 +932,7 @@ def read_accounts_csv_file(file_path) -> list:
                 acc = (row[0] or '').strip()
                 if not acc or not acc.isdigit():
                     logger.warning(f"Пропуск строки {i + 1}: ЛС не число: '{row[0]}'")
+                    skipped += 1
                     continue
                 accounts.append(acc)
 
@@ -888,6 +941,12 @@ def read_accounts_csv_file(file_path) -> list:
     except Exception as e:
         logger.error(f"Error occurred: {e}")
 
+    logger.info(
+        "[read_accounts_csv_file] Parsed accounts=%s, skipped=%s, file=%s",
+        len(accounts),
+        skipped,
+        file_path,
+    )
     return accounts
 
 
