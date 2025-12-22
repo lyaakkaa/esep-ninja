@@ -364,7 +364,7 @@ def synchronize_esep_db_with_aca_data(
                 break
 
     # --- Транзакция с мягкими сессионными настройками и retry ---  # <<< CHANGE
-    MAX_RETRIES = 3
+    MAX_RETRIES = 5
     backoff = 1.0
 
     for attempt in range(1, MAX_RETRIES + 1):
@@ -811,9 +811,16 @@ def synchronize_esep_db_with_aca_data(
             except Exception:
                 pass
 
-            # Deadlock (1213) / Lock wait timeout (1205): аккуратно повторим  # <<< CHANGE
-            if getattr(e, "errno", None) in (1205, 1213) and attempt < MAX_RETRIES:
-                logger.warning("Transaction retry %s/%s after MySQL error %s: %s", attempt, MAX_RETRIES, e.errno, e)
+            # Deadlock (1213) / Lock wait timeout (1205) / Lost connection (2006/2013): аккуратно повторим  # <<< CHANGE
+            if getattr(e, "errno", None) in (1205, 1213, 2006, 2013) and attempt < MAX_RETRIES:
+                logger.warning(
+                    "Transaction retry %s/%s after MySQL error %s: %s",
+                    attempt,
+                    MAX_RETRIES,
+                    e.errno,
+                    e,
+                )
+                # минимальная передышка, чтобы дать InnoDB освободить блокировки или поднять соединение
                 time.sleep(backoff)
                 backoff *= 2
                 continue
