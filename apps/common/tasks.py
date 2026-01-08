@@ -1,6 +1,5 @@
 import csv
-import logging
-from typing import Optional, List, Tuple, Dict, Any
+from typing import Optional, List, Tuple, Dict, Any, Iterable
 import chardet
 import requests
 import mysql.connector
@@ -15,7 +14,52 @@ from apps.common.utils import safe_int_or_none, _safe_split_ws, normalize_phone
 from config.celery_app import cel_app
 import time  # <<< CHANGE
 
-logger = logging.getLogger("common")
+BATCH_SIZE = getattr(config, "UPDATE_BATCH_SIZE", 200)
+
+
+def _chunked(items: List[Any], size: int) -> Iterable[List[Any]]:
+    for i in range(0, len(items), size):
+        yield items[i:i + size]
+
+
+def _init_report_json() -> Dict[str, Any]:
+    return {
+        ReportTypes.IN_VODOKANAL_NOT_IN_ESEP: [],
+        ReportTypes.IN_VODOKANAL_NO_ACCOUNT_IN_ESEP: set(),
+        ReportTypes.ZERO_IN_VODOKANAL_NOT_IN_ESEP: [],
+        ReportTypes.IN_ESEP_NOT_IN_VODOKANAL: [],
+        ReportTypes.ADDED_NEW_DEVICES: [],
+        ReportTypes.REMOVED_REDUNDANT_DEVICES: [],
+        ReportTypes.SUCCESSFULLY_UPDATED_DEVICES: [],
+        ReportTypes.EMPTY_BODY_FROM_VODOKANAL_API: [],
+        'rollback_data': {
+            'bank_books': [],
+            'update': {'devices': [], 'indications': []},
+            'delete': {'devices': [], 'indications': []},
+            'reset_deletion': {'devices': [], 'indications': []},
+            'create': {'devices': [], 'indications': []},
+        },
+        'DETAILED_DEVICE_UPDATES': [],
+        'DETAILED_DEVICE_DELETIONS': [],
+        'DETAILED_DEVICE_ADDED': [],
+        'DETAILED_BANKBOOK_UPDATES': [],
+    }
+
+
+def _merge_report_json(target: Dict[str, Any], source: Dict[str, Any]) -> Dict[str, Any]:
+    for key, value in source.items():
+        if key == 'rollback_data':
+            for rb_key, rb_value in value.items():
+                if isinstance(rb_value, dict):
+                    for sub_key, sub_list in rb_value.items():
+                        target['rollback_data'][rb_key][sub_key].extend(sub_list)
+                else:
+                    target['rollback_data'][rb_key].extend(rb_value)
+        elif isinstance(value, set):
+            target[key].update(value)
+        else:
+            target[key].extend(value)
+    return target
 
 
 # ==========
@@ -74,7 +118,6 @@ def update_outdated_esep_devices_periodic_task():
             pass
 
         if not connection.is_connected():
-            logger.error("ESEP DB connection failed")
             return
 
         cursor = connection.cursor(buffered=True)
@@ -101,11 +144,8 @@ def update_outdated_esep_devices_periodic_task():
 
         if numeric_accounts:
             update_esep_db_task.delay(update_obj_pk=update_instance.pk, account_numbers=numeric_accounts)
-        else:
-            logger.info("No outdated accounts")
     except Exception as e:
         msg = str(e)
-        logger.error(msg)
         update_instance.status = UpdateStatuses.FAILED
         update_instance.status_reason = msg
         update_instance.completed_at = timezone.now()
@@ -115,17 +155,12 @@ def update_outdated_esep_devices_periodic_task():
 @cel_app.task(bind=True, max_retries=5)
 def update_esep_db_task(self, update_obj_pk: int, account_numbers: list = None):
     close_old_connections()
-    logger.info(
-        "[update_esep_db_task] Start update: pk=%s, account_numbers_provided=%s",
-        update_obj_pk,
-        bool(account_numbers),
-    )
     update_instance = UpdateHistory.objects.filter(pk=update_obj_pk).first()
     if not update_instance:
         raise self.retry(exc=OperationalError("Instance not found"))
 
     try:
-        total_report_json = None
+        total_report_json = _init_report_json()
 
         if update_instance.updating_type == UpdatingTypes.BY_API:
             if not account_numbers:
@@ -135,112 +170,94 @@ def update_esep_db_task(self, update_obj_pk: int, account_numbers: list = None):
                 if not account_numbers:
                     raise ValueError("В файле ЛС не найдено ни одной валидной строки для BY_API обновления")
 
-            logger.info(
-                "[update_esep_db_task] BY_API mode. Accounts to update: %s. Automatic=%s. File=%s",
-                len(account_numbers),
-                update_instance.is_automatic,
-                update_instance.data_file.path if update_instance.data_file else None,
-            )
+            empty_accounts_all: List[str] = []
+            for batch in _chunked(account_numbers, BATCH_SIZE):
+                accounts_data: Dict[str, Dict[str, Any]] = {}
+                empty_accounts: List[str] = []
 
-            accounts_data: Dict[str, Dict[str, Any]] = {}
-            empty_accounts: List[str] = []
-
-            for account_number in account_numbers:
-                ACA_SERVICE_URL = (
-                    config.ACA_SERVICE_HOST
-                    + "/api/getValueByAccountNumber?accountNumber={account_number}&apikey={api_key}"
-                )
-                api_url = ACA_SERVICE_URL.format(
-                    account_number=str(account_number).strip(),
-                    api_key=config.ACA_SERVICE_API_KEY
-                )
-
-                try:
-                    response = requests.get(api_url, verify=False, timeout=10)
-                except requests.exceptions.RequestException as req_err:
-                    logger.error(
-                        "[update_esep_db_task] ACA request error for account=%s: %s",
-                        account_number,
-                        req_err,
+                for account_number in batch:
+                    ACA_SERVICE_URL = (
+                        config.ACA_SERVICE_HOST
+                        + "/api/getValueByAccountNumber?accountNumber={account_number}&apikey={api_key}"
                     )
-                    continue
+                    api_url = ACA_SERVICE_URL.format(
+                        account_number=str(account_number).strip(),
+                        api_key=config.ACA_SERVICE_API_KEY
+                    )
 
-                if response.status_code != 200:
-                    # 404 — пустой аккаунт
-                    if response.status_code == 404:
+                    try:
+                        response = requests.get(api_url, verify=False, timeout=10)
+                    except requests.exceptions.RequestException:
+                        continue
+
+                    if response.status_code != 200:
+                        if response.status_code == 404:
+                            empty_accounts.append(account_number)
+                        else:
+                            try:
+                                error_data = response.json()
+                                if error_data.get("error") == "wrong apikey":
+                                    raise Exception("wrong apikey")
+                            except ValueError:
+                                pass
+                        continue
+
+                    if not (response.headers.get('Content-Type') or '').startswith('application/json'):
+                        continue
+
+                    try:
+                        account_data = response.json()
+                    except ValueError:
+                        continue
+
+                    if not account_data or not account_data.get('counters'):
                         empty_accounts.append(account_number)
-                    else:
-                        logger.warning(
-                            "[update_esep_db_task] ACA non-200 response %s for account=%s: %s",
-                            response.status_code,
-                            account_number,
-                            response.text[:200],
-                        )
-                        # возможно wrong apikey в JSON
-                        try:
-                            error_data = response.json()
-                            if error_data.get("error") == "wrong apikey":
-                                raise Exception("wrong apikey")
-                        except ValueError:
-                            pass
-                    continue
+                        continue
 
-                # ожидаем JSON
-                if not (response.headers.get('Content-Type') or '').startswith('application/json'):
-                    logger.error(
-                        "[update_esep_db_task] Unexpected Content-Type from ACA for account=%s: %s",
-                        account_number,
-                        response.headers.get('Content-Type'),
-                    )
-                    continue
+                    phone_from_api = account_data.get('phone') or account_data.get('phoneOwner')
+                    phone_from_api = str(phone_from_api) if phone_from_api is not None else None
 
-                try:
-                    account_data = response.json()
-                except ValueError:
-                    logger.error("[update_esep_db_task] ACA API returned invalid JSON for account=%s", account_number)
-                    continue
+                    devices = [
+                        {
+                            "device_number": c.get('factory', ''),
+                            "modem": c.get('modem', ""),
+                            "source": c.get('source', ''),
+                            "last_check": c['previousVerificationDate'][:10] if c.get('previousVerificationDate') else None,
+                            "next_check": c['nextVerificationDate'][:10] if c.get('nextVerificationDate') else None,
+                            "water_type": 1 if c.get('isCold', True) else 2,
+                            "value": safe_int_or_none(c.get('value')),
+                        }
+                        for c in account_data.get('counters')
+                    ]
 
-                # нет счётчиков — фиксируем пустые
-                if not account_data or not account_data.get('counters'):
-                    empty_accounts.append(account_number)
-                    continue
-
-                # поддержка телефона
-                phone_from_api = account_data.get('phone') or account_data.get('phoneOwner')
-                phone_from_api = str(phone_from_api) if phone_from_api is not None else None
-
-                devices = [
-                    {
-                        "device_number": c.get('factory', ''),
-                        "modem": c.get('modem', ""),
-                        "source": c.get('source', ''),
-                        "last_check": c['previousVerificationDate'][:10] if c.get('previousVerificationDate') else None,
-                        "next_check": c['nextVerificationDate'][:10] if c.get('nextVerificationDate') else None,
-                        "water_type": 1 if c.get('isCold', True) else 2,
-                        "value": safe_int_or_none(c.get('value')),
+                    acc_key = str(account_data.get('accountNumber') or account_number).strip()
+                    accounts_data[acc_key] = {
+                        "devices": devices,
+                        "phone": phone_from_api
                     }
-                    for c in account_data.get('counters')
-                ]
 
-                acc_key = str(account_data.get('accountNumber') or account_number).strip()
-                accounts_data[acc_key] = {
-                    "devices": devices,
-                    "phone": phone_from_api
-                }
+                if accounts_data:
+                    batch_report = synchronize_esep_db_with_aca_data(
+                        accounts_data,
+                        update_obj_pk,
+                        company_id=update_instance.company_id,
+                    )
+                    _merge_report_json(total_report_json, batch_report)
+                empty_accounts_all.extend(empty_accounts)
 
-            logger.info(
-                "[update_esep_db_task] ACA fetch finished: requested=%s, got_data=%s, empty_accounts=%s",
-                len(account_numbers),
-                len(accounts_data),
-                len(empty_accounts),
-            )
-            # синхронизация (название функции историческое)
-            total_report_json = synchronize_esep_db_with_aca_data(accounts_data, update_obj_pk, company_id=update_instance.company_id)
-            total_report_json[ReportTypes.EMPTY_BODY_FROM_VODOKANAL_API] = empty_accounts
+            total_report_json[ReportTypes.EMPTY_BODY_FROM_VODOKANAL_API] = empty_accounts_all
 
         elif update_instance.updating_type == UpdatingTypes.BY_FILE:
             csv_data = get_aca_devices_from_csv_file(update_instance.data_file.path)
-            total_report_json = synchronize_esep_db_with_aca_data(csv_data, update_obj_pk, company_id=update_instance.company_id)
+            csv_items = list(csv_data.items())
+            for batch in _chunked(csv_items, BATCH_SIZE):
+                batch_data = dict(batch)
+                batch_report = synchronize_esep_db_with_aca_data(
+                    batch_data,
+                    update_obj_pk,
+                    company_id=update_instance.company_id,
+                )
+                _merge_report_json(total_report_json, batch_report)
 
         else:
             raise Exception(f"Unknown updating_type: {update_instance.updating_type}")
@@ -263,15 +280,9 @@ def update_esep_db_task(self, update_obj_pk: int, account_numbers: list = None):
             ])
 
         update_instance.status = UpdateStatuses.SUCCESS
-        logger.info(
-            "[update_esep_db_task] Update finished successfully: pk=%s, reports=%s",
-            update_obj_pk,
-            list(total_report_json.keys()) if total_report_json else [],
-        )
 
     except Exception as e:
         msg = str(e)
-        logger.exception("[update_esep_db_task] Failed update pk=%s: %s", update_obj_pk, msg)
         update_instance.status = UpdateStatuses.FAILED
         if "HTTPSConnectionPool" in msg:
             msg = "Не доходит запрос до АСА API сервиса: " + msg
@@ -281,7 +292,6 @@ def update_esep_db_task(self, update_obj_pk: int, account_numbers: list = None):
         close_old_connections()
         update_instance.completed_at = timezone.now()
         update_instance.save()
-        logger.info("[update_esep_db_task] Update finalized: pk=%s, status=%s", update_obj_pk, update_instance.status)
 
 
 def get_params_for_update(aca_device, current_next_check=None):
@@ -334,28 +344,7 @@ def synchronize_esep_db_with_aca_data(
     Синхронизация ESEP с внешними данными (унифицированный формат).
     Если задан company_id — ограничиваемся ЛС/устройствами этой компании.
     """
-    total_report_json = {
-        ReportTypes.IN_VODOKANAL_NOT_IN_ESEP: [],
-        ReportTypes.IN_VODOKANAL_NO_ACCOUNT_IN_ESEP: set(),
-        ReportTypes.ZERO_IN_VODOKANAL_NOT_IN_ESEP: [],
-        ReportTypes.IN_ESEP_NOT_IN_VODOKANAL: [],
-        ReportTypes.ADDED_NEW_DEVICES: [],
-        ReportTypes.REMOVED_REDUNDANT_DEVICES: [],
-        ReportTypes.SUCCESSFULLY_UPDATED_DEVICES: [],
-        ReportTypes.EMPTY_BODY_FROM_VODOKANAL_API: [],
-        'rollback_data': {
-            'bank_books': [],
-            'update': {'devices': [], 'indications': []},
-            'delete': {'devices': [], 'indications': []},
-            'reset_deletion': {'devices': [], 'indications': []},
-            'create': {'devices': [], 'indications': []},
-        },
-        # Новые детализированные отчёты
-        'DETAILED_DEVICE_UPDATES': [],     # [{ account_number, device_id, device_number, before, after, changes }]
-        'DETAILED_DEVICE_DELETIONS': [],   # [{ account_number, device_id, device_number, before, after=None, changes, action=deleted }]
-        'DETAILED_DEVICE_ADDED': [],       # [{ account_number, device_id, device_number, before=None, after, changes, action=created }]
-        'DETAILED_BANKBOOK_UPDATES': [],   # [{ account_number, bankbook_id, before, after, changes }]
-    }
+    total_report_json = _init_report_json()
 
     def remove_first_occurrence(device_list, device_number):
         for i, device in enumerate(device_list):
@@ -377,13 +366,6 @@ def synchronize_esep_db_with_aca_data(
                 raise Exception("DB not connected")
             cursor = connection.cursor(buffered=True)
             connection.autocommit = False
-
-            logger.debug(
-                "[sync] Attempt %s/%s: connected to DB '%s'",
-                attempt,
-                MAX_RETRIES,
-                getattr(connection, "database", "unknown"),
-            )
 
             # важные сессионные настройки против блокировок
             cursor.execute("SET SESSION TRANSACTION ISOLATION LEVEL READ COMMITTED")
@@ -409,7 +391,6 @@ def synchronize_esep_db_with_aca_data(
                     aca_phone, new_name, new_people = None, None, None
 
                 if not aca_account_number or not str(aca_account_number).strip().isdigit():
-                    logger.warning(f"Skip invalid account key: '{aca_account_number}'")
                     continue
 
                 account_id = int(str(aca_account_number).strip())
@@ -800,7 +781,6 @@ def synchronize_esep_db_with_aca_data(
 
             # commit
             connection.commit()
-            logger.info("[sync] Commit success on attempt %s/%s", attempt, MAX_RETRIES)
             break  # успех, выходим из retry-цикла
 
         except mysql.connector.Error as e:
@@ -813,18 +793,10 @@ def synchronize_esep_db_with_aca_data(
 
             # Deadlock (1213) / Lock wait timeout (1205) / Lost connection (2006/2013): аккуратно повторим  # <<< CHANGE
             if getattr(e, "errno", None) in (1205, 1213, 2006, 2013) and attempt < MAX_RETRIES:
-                logger.warning(
-                    "Transaction retry %s/%s after MySQL error %s: %s",
-                    attempt,
-                    MAX_RETRIES,
-                    e.errno,
-                    e,
-                )
                 # минимальная передышка, чтобы дать InnoDB освободить блокировки или поднять соединение
                 time.sleep(backoff)
                 backoff *= 2
                 continue
-            logger.exception("SYNC error (no retry), rolled back: %s", e)
             raise
         except Exception as e:
             try:
@@ -832,7 +804,6 @@ def synchronize_esep_db_with_aca_data(
                     connection.rollback()
             except Exception:
                 pass
-            logger.exception("SYNC error, rolled back: %s", e)
             raise
         finally:
             try:
@@ -923,14 +894,12 @@ def check_source(source):
 def read_accounts_csv_file(file_path) -> list:
     """Возвращает список строк-ЛС. Валидирует, что ЛС — число; иначе warning и пропуск."""
     accounts: List[str] = []
-    skipped = 0
     detected_encoding = 'utf-8'
     try:
         with open(file_path, 'rb') as f:
             raw_data = f.read()
             detected_encoding = chardet.detect(raw_data)['encoding'] or 'utf-8'
 
-        logger.info("[read_accounts_csv_file] %s detected encoding=%s", file_path, detected_encoding)
         with open(file_path, 'r', encoding=detected_encoding) as file:
             reader = csv.reader(file, delimiter=';')
             for i, row in enumerate(reader):
@@ -938,22 +907,13 @@ def read_accounts_csv_file(file_path) -> list:
                     continue
                 acc = (row[0] or '').strip()
                 if not acc or not acc.isdigit():
-                    logger.warning(f"Пропуск строки {i + 1}: ЛС не число: '{row[0]}'")
-                    skipped += 1
                     continue
                 accounts.append(acc)
 
     except FileNotFoundError:
-        logger.error("File not found or path is incorrect.")
+        pass
     except Exception as e:
-        logger.error(f"Error occurred: {e}")
-
-    logger.info(
-        "[read_accounts_csv_file] Parsed accounts=%s, skipped=%s, file=%s",
-        len(accounts),
-        skipped,
-        file_path,
-    )
+        _ = e
     return accounts
 
 
@@ -977,11 +937,10 @@ def get_aca_devices_from_csv_file(file_path):
 
                 account_number = (row[10] or '').strip()
                 if not account_number or not account_number.isdigit():
-                    logger.warning(f"CSV ACA: пропуск строки {i + 1}: ЛС некорректен: '{row[10]}'")
                     continue
 
                 if row[12] and not row[22]:
-                    logger.debug(f"CSV ACA: странная строка (есть номер, нет показаний): {row}")
+                    pass
 
                 entry = csv_data.setdefault(account_number, {"devices": [], "phone": None})
                 entry["devices"].append({
@@ -998,9 +957,9 @@ def get_aca_devices_from_csv_file(file_path):
                     break
 
     except FileNotFoundError:
-        logger.error("File not found or path is incorrect.")
+        pass
     except Exception as e:
-        logger.error(f"Error occurred: {e}")
+        _ = e
 
     return csv_data
 
@@ -1060,55 +1019,63 @@ def update_kok_db_task(self, update_obj_pk: int, account_numbers: list = None):
         raise self.retry(exc=OperationalError("Instance not found"))
 
     try:
-        total_report_json = None
+        total_report_json = _init_report_json()
 
         if update_instance.updating_type == UpdatingTypes.BY_API:
             if not account_numbers:
                 account_numbers = read_accounts_csv_file(update_instance.data_file.path) if update_instance.data_file else []
 
             headers = {"Authorization": "Basic MTox", "Accept": "application/json"}
-            accounts_data, empty_accounts = {}, []
+            empty_accounts_all: List[str] = []
 
-            for rca in account_numbers:
-                url = f"http://suarnasik.hopto.org:4444/abon/hs/upr/people?rca={str(rca).strip()}"
-                try:
-                    resp = requests.get(url, headers=headers, timeout=10)
-                except requests.exceptions.RequestException as e:
-                    logger.error(f"[KOK] request error for {rca}: {e}")
-                    continue
+            for batch in _chunked(account_numbers, BATCH_SIZE):
+                accounts_data, empty_accounts = {}, []
 
-                if resp.status_code != 200:
-                    if resp.status_code == 404:
+                for rca in batch:
+                    url = f"http://suarnasik.hopto.org:4444/abon/hs/upr/people?rca={str(rca).strip()}"
+                    try:
+                        resp = requests.get(url, headers=headers, timeout=10)
+                    except requests.exceptions.RequestException:
+                        continue
+
+                    if resp.status_code != 200:
+                        if resp.status_code == 404:
+                            empty_accounts.append(rca)
+                        continue
+
+                    try:
+                        data = resp.json()
+                    except ValueError:
+                        import json
+                        data = json.loads(resp.content.decode("utf-8-sig", errors="replace"))
+
+                    if not data or str(data.get("success")).lower() != "true":
                         empty_accounts.append(rca)
-                    else:
-                        logger.warning(f"[KOK] {resp.status_code}: {resp.text[:200]}")
-                    continue
+                        continue
 
-                # сервер может не выставлять Content-Type
-                try:
-                    data = resp.json()
-                except ValueError:
-                    import json
-                    data = json.loads(resp.content.decode("utf-8-sig", errors="replace"))
+                    payload = _parse_kok_response_to_account_payload(data)
+                    acc_number = str(data.get("terminal") or rca).strip()
+                    accounts_data[acc_number] = payload
 
-                if not data or str(data.get("success")).lower() != "true":
-                    empty_accounts.append(rca)
-                    continue
+                if accounts_data:
+                    batch_report = synchronize_esep_db_with_aca_data(
+                        accounts_data, update_obj_pk, company_id=COMPANY_ID
+                    )
+                    _merge_report_json(total_report_json, batch_report)
 
-                payload = _parse_kok_response_to_account_payload(data)
-                acc_number = str(data.get("terminal") or rca).strip()
-                accounts_data[acc_number] = payload
+                empty_accounts_all.extend(empty_accounts)
 
-            total_report_json = synchronize_esep_db_with_aca_data(
-                accounts_data, update_obj_pk, company_id=COMPANY_ID
-            )
-            total_report_json[ReportTypes.EMPTY_BODY_FROM_VODOKANAL_API] = empty_accounts
+            total_report_json[ReportTypes.EMPTY_BODY_FROM_VODOKANAL_API] = empty_accounts_all
 
         elif update_instance.updating_type == UpdatingTypes.BY_FILE:
             csv_data = get_kok_devices_from_csv_file(update_instance.data_file.path)
-            total_report_json = synchronize_esep_db_with_aca_data(
-                csv_data, update_obj_pk, company_id=COMPANY_ID
-            )
+            csv_items = list(csv_data.items())
+            for batch in _chunked(csv_items, BATCH_SIZE):
+                batch_data = dict(batch)
+                batch_report = synchronize_esep_db_with_aca_data(
+                    batch_data, update_obj_pk, company_id=COMPANY_ID
+                )
+                _merge_report_json(total_report_json, batch_report)
 
         else:
             raise Exception(f"Unknown updating_type: {update_instance.updating_type}")
@@ -1133,7 +1100,6 @@ def update_kok_db_task(self, update_obj_pk: int, account_numbers: list = None):
 
     except Exception as e:
         msg = str(e)
-        logger.error(msg)
         update_instance.status = UpdateStatuses.FAILED
         update_instance.status_reason = msg
     finally:
@@ -1153,7 +1119,6 @@ def update_outdated_kok_devices_periodic_task():
             pass
 
         if not connection.is_connected():
-            logger.error("ESEP DB connection failed")
             return
 
         cursor = connection.cursor(buffered=True)
@@ -1179,12 +1144,9 @@ def update_outdated_kok_devices_periodic_task():
         accounts = [str(acc).strip() for (acc,) in rows if str(acc).strip().isdigit()]
         if accounts:
             update_kok_db_task.delay(update_obj_pk=update_instance.pk, account_numbers=accounts)
-        else:
-            logger.info("[Periodic KOK] No accounts to update")
 
     except Exception as e:
         msg = str(e)
-        logger.error(msg)
         update_instance.status = UpdateStatuses.FAILED
         update_instance.status_reason = msg
         update_instance.completed_at = timezone.now()
@@ -1205,7 +1167,6 @@ def get_kok_devices_from_csv_file(file_path: str):
     }
     """
     csv_data: Dict[str, Dict[str, Any]] = {}
-    logger.info(f"[KOK CSV] {file_path}")
 
     # детект кодировки (часто windows-1251)
     detected = 'utf-8'
@@ -1245,7 +1206,6 @@ def get_kok_devices_from_csv_file(file_path: str):
                     continue
                 acc = (row[IDX_ACC] or "").strip()
                 if not acc.isdigit():
-                    logger.warning(f"[KOK CSV] пропуск строки {i}: ЛС '{acc}' не число")
                     continue
 
                 t = str(row[IDX_TYPE] or "").strip().lower()
@@ -1268,8 +1228,8 @@ def get_kok_devices_from_csv_file(file_path: str):
                 })
 
     except FileNotFoundError:
-        logger.error("File not found or path is incorrect.")
+        pass
     except Exception as e:
-        logger.error(f"Error occurred: {e}")
+        _ = e
 
     return csv_data
