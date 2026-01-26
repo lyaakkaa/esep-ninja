@@ -25,6 +25,9 @@ def chunks(lst, n):
         yield lst[i:i + n]
 
 
+DELETE_DEVICES_BATCH_SIZE = 500
+
+
 # ==========
 # DIFF HELPER
 # ==========
@@ -774,12 +777,13 @@ def synchronize_esep_db_with_aca_data(
                             ['%s'] * len(devices_for_delete))
                         # фиксируем порядок по id в IN через сортировку ключей — детерминированный план  # <<< CHANGE
                         ids_sorted = sorted(devices_for_delete.keys())
-                        sql_query = (
-                            f"UPDATE devices SET deleted_by = 693, deleted_at = NOW(), "
-                            f"comment = 'ninja_update {str(update_obj_pk)}' "
-                            f"WHERE id IN ({', '.join(['%s'] * len(ids_sorted))})"
-                        )
-                        cursor.execute(sql_query, ids_sorted)
+                        for ids_chunk in chunks(ids_sorted, DELETE_DEVICES_BATCH_SIZE):
+                            sql_query = (
+                                "UPDATE devices SET deleted_by = 693, deleted_at = NOW(), "
+                                f"comment = 'ninja_update {str(update_obj_pk)}' "
+                                f"WHERE id IN ({', '.join(['%s'] * len(ids_chunk))})"
+                            )
+                            cursor.execute(sql_query, ids_chunk)
                         for did in ids_sorted:
                             dnumber = devices_for_delete[did]
                             total_report_json[ReportTypes.REMOVED_REDUNDANT_DEVICES].append(
