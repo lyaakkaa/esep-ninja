@@ -1132,7 +1132,12 @@ def update_kok_db_task(self, update_obj_pk: int, account_numbers: list = None):
     # We only need the instance to check configs, NOT to save status yet
     update_instance = UpdateHistory.objects.filter(pk=update_obj_pk).first()
     if not update_instance:
-        raise self.retry(exc=OperationalError("Instance not found"))
+        logger.error(
+            "[KOK] UpdateHistory not found for pk=%s", update_obj_pk)
+        return {
+            "error": "UpdateHistory instance not found",
+            "batch_accounts": account_numbers or [],
+        }
 
     try:
         total_report_json = None
@@ -1191,11 +1196,20 @@ def update_kok_db_task(self, update_obj_pk: int, account_numbers: list = None):
 
             return total_report_json
 
+        return {
+            "error": f"Unknown updating_type: {update_instance.updating_type}",
+            "batch_accounts": account_numbers or [],
+        }
+
     except Exception as e:
+        import traceback
         msg = str(e)
-        logger.error(msg)
-        update_instance.status = UpdateStatuses.FAILED
-        update_instance.status_reason = msg
+        logger.exception("[KOK] Chunk failed for pk=%s: %s", update_obj_pk, msg)
+        return {
+            "error": msg,
+            "batch_accounts": account_numbers or [],
+            "trace": traceback.format_exc(),
+        }
     finally:
         close_old_connections()
         # update_instance.completed_at = timezone.now()
@@ -1287,6 +1301,15 @@ def finalize_update_history(results, update_obj_pk):
     try:
         update_instance = UpdateHistory.objects.get(pk=update_obj_pk)
 
+        def _normalize_for_json(value):
+            if isinstance(value, (datetime, date)):
+                return value.isoformat()
+            if isinstance(value, dict):
+                return {k: _normalize_for_json(v) for k, v in value.items()}
+            if isinstance(value, (list, tuple, set)):
+                return [_normalize_for_json(v) for v in value]
+            return value
+
         # 1. Initialize the Master Report Structure
         aggregated_report = {
             ReportTypes.IN_VODOKANAL_NOT_IN_ESEP: [],
@@ -1312,6 +1335,8 @@ def finalize_update_history(results, update_obj_pk):
         }
 
         failed_chunks_count = 0
+        error_chunks = []
+        total_chunks = len(results or [])
 
         # 2. Merge Loop
         for chunk_result in results:
@@ -1321,6 +1346,11 @@ def finalize_update_history(results, update_obj_pk):
             # Handle failed chunks gracefully
             if "error" in chunk_result:
                 failed_chunks_count += 1
+                error_chunks.append({
+                    "error": chunk_result.get("error"),
+                    "batch_accounts": chunk_result.get("batch_accounts", []),
+                    "trace": chunk_result.get("trace"),
+                })
                 continue
 
             # Merge Lists
@@ -1338,7 +1368,7 @@ def finalize_update_history(results, update_obj_pk):
                             for action_key in rb_target[rb_key]:
                                 if action_key in rb_source[rb_key]:
                                     rb_target[rb_key][action_key].extend(
-                                        rb_source[rb_key][action_key])
+                                    rb_source[rb_key][action_key])
 
                 elif isinstance(aggregated_report[key], list):
                     # Standard list merge
@@ -1361,7 +1391,8 @@ def finalize_update_history(results, update_obj_pk):
         if aggregated_report.get('rollback_data'):
             UpdateHistoryRollback.objects.create(
                 update_history=update_instance,
-                data_json=aggregated_report.pop('rollback_data', None)
+                data_json=_normalize_for_json(
+                    aggregated_report.pop('rollback_data', None))
             )
 
         # 5. Save Report Objects (Grouped by type, not batch)
@@ -1372,25 +1403,42 @@ def finalize_update_history(results, update_obj_pk):
             # Or include them if your system expects them.
             # Assuming 'data_items' is a list:
             if isinstance(data_items, list):
+                normalized_items = _normalize_for_json(data_items)
                 reports_to_create.append(UpdateHistoryReport(
                     update_history=update_instance,
                     report_type=str(report_type).upper(),
                     data_json={
-                        "amount_total": len(data_items),
-                        "items": data_items
+                        "amount_total": len(normalized_items),
+                        "items": normalized_items
                     },
                 ))
+
+        if error_chunks:
+            normalized_errors = _normalize_for_json(error_chunks)
+            reports_to_create.append(UpdateHistoryReport(
+                update_history=update_instance,
+                report_type="CHUNK_ERRORS",
+                data_json={
+                    "amount_total": len(normalized_errors),
+                    "items": normalized_errors,
+                },
+            ))
 
         if reports_to_create:
             UpdateHistoryReport.objects.bulk_create(reports_to_create)
 
         # 6. Final Status Update
-        if failed_chunks_count > 0:
+        if total_chunks > 0 and failed_chunks_count == total_chunks:
+            update_instance.status = UpdateStatuses.FAILED
+            update_instance.status_reason = "All chunks failed."
+        elif failed_chunks_count > 0:
             logger.warning(
                 f"Update finished but {failed_chunks_count} chunks failed.")
             update_instance.status_reason = f"Finished with {failed_chunks_count} chunk errors."
-
-        update_instance.status = UpdateStatuses.SUCCESS
+            update_instance.status = UpdateStatuses.SUCCESS
+        else:
+            update_instance.status = UpdateStatuses.SUCCESS
+            update_instance.status_reason = None
         update_instance.completed_at = timezone.now()
         update_instance.save()
 
