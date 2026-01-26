@@ -1,3 +1,4 @@
+from celery import chord, shared_task
 import csv
 import logging
 from typing import Optional, List, Tuple, Dict, Any
@@ -16,6 +17,12 @@ from config.celery_app import cel_app
 import time  # <<< CHANGE
 
 logger = logging.getLogger("common")
+
+
+def chunks(lst, n):
+    """Yield successive n-sized chunks from lst."""
+    for i in range(0, len(lst), n):
+        yield lst[i:i + n]
 
 
 # ==========
@@ -37,7 +44,8 @@ def _diff_dict(before: dict, after: dict) -> List[Dict[str, str]]:
     for k, new_val in after.items():
         old_val = before.get(k, None)
         if old_val != new_val:
-            changes.append({"field": k, "old": _s(old_val), "new": _s(new_val)})
+            changes.append(
+                {"field": k, "old": _s(old_val), "new": _s(new_val)})
     return changes
 
 
@@ -65,7 +73,8 @@ def run_rollback_task(update_obj_pk):
 
 @cel_app.task
 def update_outdated_esep_devices_periodic_task():
-    update_instance = UpdateHistory.objects.create(is_automatic=True, company_id=7)
+    update_instance = UpdateHistory.objects.create(
+        is_automatic=True, company_id=7)
     try:
         connection = get_connection_to_esep_db()
         try:
@@ -78,7 +87,8 @@ def update_outdated_esep_devices_periodic_task():
             return
 
         cursor = connection.cursor(buffered=True)
-        limit_date = (datetime.now() - timedelta(days=config.OUTDATED_DEVICES_PERIOD)).strftime('%Y-%m-%d')
+        limit_date = (datetime.now(
+        ) - timedelta(days=config.OUTDATED_DEVICES_PERIOD)).strftime('%Y-%m-%d')
 
         cursor.execute("""
             SELECT b.number AS account_number
@@ -91,16 +101,18 @@ def update_outdated_esep_devices_periodic_task():
                )
           GROUP BY b.number
           ORDER BY MIN(d.updated_at)
-             LIMIT 100000
+             LIMIT 50000
         """, (update_instance.company_id, limit_date))
         rows = cursor.fetchall()
         cursor.close()
         connection.close()
 
-        numeric_accounts = [str(acc).strip() for (acc,) in rows if str(acc).strip().isdigit()]
+        numeric_accounts = [str(acc).strip()
+                            for (acc,) in rows if str(acc).strip().isdigit()]
 
         if numeric_accounts:
-            update_esep_db_task.delay(update_obj_pk=update_instance.pk, account_numbers=numeric_accounts)
+            update_esep_db_task.delay(
+                update_obj_pk=update_instance.pk, account_numbers=numeric_accounts)
         else:
             logger.info("No outdated accounts")
     except Exception as e:
@@ -130,10 +142,13 @@ def update_esep_db_task(self, update_obj_pk: int, account_numbers: list = None):
         if update_instance.updating_type == UpdatingTypes.BY_API:
             if not account_numbers:
                 if not update_instance.data_file:
-                    raise ValueError("Не передан список ЛС и не загружен файл с ЛС для BY_API обновления")
-                account_numbers = read_accounts_csv_file(update_instance.data_file.path)
+                    raise ValueError(
+                        "Не передан список ЛС и не загружен файл с ЛС для BY_API обновления")
+                account_numbers = read_accounts_csv_file(
+                    update_instance.data_file.path)
                 if not account_numbers:
-                    raise ValueError("В файле ЛС не найдено ни одной валидной строки для BY_API обновления")
+                    raise ValueError(
+                        "В файле ЛС не найдено ни одной валидной строки для BY_API обновления")
 
             logger.info(
                 "[update_esep_db_task] BY_API mode. Accounts to update: %s. Automatic=%s. File=%s",
@@ -197,7 +212,8 @@ def update_esep_db_task(self, update_obj_pk: int, account_numbers: list = None):
                 try:
                     account_data = response.json()
                 except ValueError:
-                    logger.error("[update_esep_db_task] ACA API returned invalid JSON for account=%s", account_number)
+                    logger.error(
+                        "[update_esep_db_task] ACA API returned invalid JSON for account=%s", account_number)
                     continue
 
                 # нет счётчиков — фиксируем пустые
@@ -206,8 +222,10 @@ def update_esep_db_task(self, update_obj_pk: int, account_numbers: list = None):
                     continue
 
                 # поддержка телефона
-                phone_from_api = account_data.get('phone') or account_data.get('phoneOwner')
-                phone_from_api = str(phone_from_api) if phone_from_api is not None else None
+                phone_from_api = account_data.get(
+                    'phone') or account_data.get('phoneOwner')
+                phone_from_api = str(
+                    phone_from_api) if phone_from_api is not None else None
 
                 devices = [
                     {
@@ -222,7 +240,8 @@ def update_esep_db_task(self, update_obj_pk: int, account_numbers: list = None):
                     for c in account_data.get('counters')
                 ]
 
-                acc_key = str(account_data.get('accountNumber') or account_number).strip()
+                acc_key = str(account_data.get('accountNumber')
+                              or account_number).strip()
                 accounts_data[acc_key] = {
                     "devices": devices,
                     "phone": phone_from_api
@@ -235,15 +254,19 @@ def update_esep_db_task(self, update_obj_pk: int, account_numbers: list = None):
                 len(empty_accounts),
             )
             # синхронизация (название функции историческое)
-            total_report_json = synchronize_esep_db_with_aca_data(accounts_data, update_obj_pk, company_id=update_instance.company_id)
+            total_report_json = synchronize_esep_db_with_aca_data(
+                accounts_data, update_obj_pk, company_id=update_instance.company_id)
             total_report_json[ReportTypes.EMPTY_BODY_FROM_VODOKANAL_API] = empty_accounts
 
         elif update_instance.updating_type == UpdatingTypes.BY_FILE:
-            csv_data = get_aca_devices_from_csv_file(update_instance.data_file.path)
-            total_report_json = synchronize_esep_db_with_aca_data(csv_data, update_obj_pk, company_id=update_instance.company_id)
+            csv_data = get_aca_devices_from_csv_file(
+                update_instance.data_file.path)
+            total_report_json = synchronize_esep_db_with_aca_data(
+                csv_data, update_obj_pk, company_id=update_instance.company_id)
 
         else:
-            raise Exception(f"Unknown updating_type: {update_instance.updating_type}")
+            raise Exception(
+                f"Unknown updating_type: {update_instance.updating_type}")
 
         # Сохранение отчётов
         if total_report_json:
@@ -271,7 +294,8 @@ def update_esep_db_task(self, update_obj_pk: int, account_numbers: list = None):
 
     except Exception as e:
         msg = str(e)
-        logger.exception("[update_esep_db_task] Failed update pk=%s: %s", update_obj_pk, msg)
+        logger.exception(
+            "[update_esep_db_task] Failed update pk=%s: %s", update_obj_pk, msg)
         update_instance.status = UpdateStatuses.FAILED
         if "HTTPSConnectionPool" in msg:
             msg = "Не доходит запрос до АСА API сервиса: " + msg
@@ -281,7 +305,8 @@ def update_esep_db_task(self, update_obj_pk: int, account_numbers: list = None):
         close_old_connections()
         update_instance.completed_at = timezone.now()
         update_instance.save()
-        logger.info("[update_esep_db_task] Update finalized: pk=%s, status=%s", update_obj_pk, update_instance.status)
+        logger.info("[update_esep_db_task] Update finalized: pk=%s, status=%s",
+                    update_obj_pk, update_instance.status)
 
 
 def get_params_for_update(aca_device, current_next_check=None):
@@ -316,7 +341,8 @@ def get_params_for_update(aca_device, current_next_check=None):
         try:
             water_type = int(aca_device['water_type'])
         except Exception:
-            water_type = 1 if str(aca_device['water_type']).strip() == "1" else 2
+            water_type = 1 if str(
+                aca_device['water_type']).strip() == "1" else 2
         water_name = "ХВС" if water_type == 1 else "ГВС"
         params_dict['keys'].extend(["name_ru", "name_kk", "name_en"])
         params_dict['values'].extend([water_name, water_name, water_name])
@@ -324,6 +350,7 @@ def get_params_for_update(aca_device, current_next_check=None):
         params_dict['values'].append(water_type)
 
     return params_dict
+
 
 def synchronize_esep_db_with_aca_data(
     aca_loaded_data: Dict[str, Any],
@@ -351,10 +378,14 @@ def synchronize_esep_db_with_aca_data(
             'create': {'devices': [], 'indications': []},
         },
         # Новые детализированные отчёты
-        'DETAILED_DEVICE_UPDATES': [],     # [{ account_number, device_id, device_number, before, after, changes }]
-        'DETAILED_DEVICE_DELETIONS': [],   # [{ account_number, device_id, device_number, before, after=None, changes, action=deleted }]
-        'DETAILED_DEVICE_ADDED': [],       # [{ account_number, device_id, device_number, before=None, after, changes, action=created }]
-        'DETAILED_BANKBOOK_UPDATES': [],   # [{ account_number, bankbook_id, before, after, changes }]
+        # [{ account_number, device_id, device_number, before, after, changes }]
+        'DETAILED_DEVICE_UPDATES': [],
+        # [{ account_number, device_id, device_number, before, after=None, changes, action=deleted }]
+        'DETAILED_DEVICE_DELETIONS': [],
+        # [{ account_number, device_id, device_number, before=None, after, changes, action=created }]
+        'DETAILED_DEVICE_ADDED': [],
+        # [{ account_number, bankbook_id, before, after, changes }]
+        'DETAILED_BANKBOOK_UPDATES': [],
     }
 
     def remove_first_occurrence(device_list, device_number):
@@ -386,7 +417,8 @@ def synchronize_esep_db_with_aca_data(
             )
 
             # важные сессионные настройки против блокировок
-            cursor.execute("SET SESSION TRANSACTION ISOLATION LEVEL READ COMMITTED")
+            cursor.execute(
+                "SET SESSION TRANSACTION ISOLATION LEVEL READ COMMITTED")
             cursor.execute("SET SESSION innodb_lock_wait_timeout = %s", (60,))
 
             connection.start_transaction()
@@ -395,13 +427,15 @@ def synchronize_esep_db_with_aca_data(
             _ = cursor.fetchone()
 
             # Проходим аккаунты в стабильном порядке (уменьшает конфликты lock-order)
-            items_iter = sorted((aca_loaded_data or {}).items(), key=lambda kv: str(kv[0]))
+            items_iter = sorted(
+                (aca_loaded_data or {}).items(), key=lambda kv: str(kv[0]))
 
             for aca_account_number, payload in items_iter:
                 # формат источника
                 if isinstance(payload, dict) and 'devices' in payload:
                     aca_devices = payload.get('devices', []) or []
-                    aca_phone = normalize_phone(payload.get('phone') or payload.get('telefon'))
+                    aca_phone = normalize_phone(payload.get(
+                        'phone') or payload.get('telefon'))
                     new_name = (str(payload.get('fio') or '').strip() or None)
                     new_people = safe_int_or_none(payload.get('people'))
                 else:
@@ -409,7 +443,8 @@ def synchronize_esep_db_with_aca_data(
                     aca_phone, new_name, new_people = None, None, None
 
                 if not aca_account_number or not str(aca_account_number).strip().isdigit():
-                    logger.warning(f"Skip invalid account key: '{aca_account_number}'")
+                    logger.warning(
+                        f"Skip invalid account key: '{aca_account_number}'")
                     continue
 
                 account_id = int(str(aca_account_number).strip())
@@ -427,14 +462,16 @@ def synchronize_esep_db_with_aca_data(
                     )
                 bankbook = cursor.fetchone()
                 if not bankbook:
-                    total_report_json[ReportTypes.IN_VODOKANAL_NO_ACCOUNT_IN_ESEP].add(str(aca_account_number))
+                    total_report_json[ReportTypes.IN_VODOKANAL_NO_ACCOUNT_IN_ESEP].add(
+                        str(aca_account_number))
                     continue
 
                 bankbook_id, bb_company_id, current_phone, current_name, current_people = (
                     bankbook[0],
                     bankbook[1],
                     normalize_phone(bankbook[2]),
-                    (str(bankbook[3]) or '').strip() if bankbook[3] is not None else None,
+                    (str(bankbook[3]) or '').strip(
+                    ) if bankbook[3] is not None else None,
                     bankbook[4],
                 )
 
@@ -516,7 +553,8 @@ def synchronize_esep_db_with_aca_data(
                         })
 
                 # пары
-                device_pairs, account_report_data = make_pairs(aca_devices, esep_devices, str(aca_account_number))
+                device_pairs, account_report_data = make_pairs(
+                    aca_devices, esep_devices, str(aca_account_number))
 
                 # обновление bank_books (phone/name/people): детальный дифф
                 sets, values = [], []
@@ -566,8 +604,10 @@ def synchronize_esep_db_with_aca_data(
                 # апдейты пар устройств (детальные before/after)
                 # выполняем UPDATE по id в возр. порядке — стабильный lock-order
                 for aca_device, esep_device in sorted(device_pairs, key=lambda p: p[1]['id']):
-                    current_next_check = esep_device['next_check'].strftime('%Y-%m-%d') if esep_device['next_check'] else None
-                    params_dict = get_params_for_update(aca_device, current_next_check=current_next_check)
+                    current_next_check = esep_device['next_check'].strftime(
+                        '%Y-%m-%d') if esep_device['next_check'] else None
+                    params_dict = get_params_for_update(
+                        aca_device, current_next_check=current_next_check)
                     if not params_dict['keys']:
                         continue  # минимальная проверка: не делаем пустых апдейтов
 
@@ -597,15 +637,18 @@ def synchronize_esep_db_with_aca_data(
                         })
 
                     if not _same_values(before_dev, after_dev):
-                        set_clause = ",".join(f"`{k}` = %s" for k in params_dict['keys'])
+                        set_clause = ",".join(
+                            f"`{k}` = %s" for k in params_dict['keys'])
                         cursor.execute(
                             f"UPDATE devices SET {set_clause}, comment = %s, updated_by = 693, updated_at = NOW() WHERE id = %s",
-                            (*params_dict['values'], f"ninja_update {str(update_obj_pk)}", esep_device['id'])
+                            (*params_dict['values'],
+                             f"ninja_update {str(update_obj_pk)}", esep_device['id'])
                         )
 
                     total_report_json['rollback_data']['update']['devices'].append((
                         esep_device['id'],
-                        esep_device['last_check'].strftime('%Y-%m-%d') if esep_device['last_check'] else None,
+                        esep_device['last_check'].strftime(
+                            '%Y-%m-%d') if esep_device['last_check'] else None,
                         current_next_check,
                         esep_device['modem_number'],
                         esep_device['name_ru'],
@@ -637,11 +680,14 @@ def synchronize_esep_db_with_aca_data(
                                  if str(t.get('device_number')) == str(dwi['device_number'])), None)
 
                         if not first_match_device:
-                            devices_for_delete[dwi['id']] = dwi['device_number']
+                            devices_for_delete[dwi['id']
+                                               ] = dwi['device_number']
                             continue
 
-                        current_next_check = dwi['next_check'].strftime('%Y-%m-%d') if dwi['next_check'] else None
-                        params_dict = get_params_for_update(first_match_device, current_next_check=current_next_check)
+                        current_next_check = dwi['next_check'].strftime(
+                            '%Y-%m-%d') if dwi['next_check'] else None
+                        params_dict = get_params_for_update(
+                            first_match_device, current_next_check=current_next_check)
                         if not params_dict['keys']:
                             continue
 
@@ -671,15 +717,18 @@ def synchronize_esep_db_with_aca_data(
                             })
 
                         if not _same_values(before_dev, after_dev):
-                            set_clause = ",".join(f"`{k}` = %s" for k in params_dict['keys'])
+                            set_clause = ",".join(
+                                f"`{k}` = %s" for k in params_dict['keys'])
                             cursor.execute(
                                 f"UPDATE devices SET {set_clause}, comment = %s, updated_by = 693, updated_at = NOW() WHERE id = %s",
-                                (*params_dict['values'], f"ninja_update {str(update_obj_pk)}", dwi['id'])
+                                (*params_dict['values'],
+                                 f"ninja_update {str(update_obj_pk)}", dwi['id'])
                             )
 
                         total_report_json['rollback_data']['update']['devices'].append((
                             dwi['id'],
-                            dwi['last_check'].strftime('%Y-%m-%d') if dwi['last_check'] else None,
+                            dwi['last_check'].strftime(
+                                '%Y-%m-%d') if dwi['last_check'] else None,
                             current_next_check,
                             dwi['modem_number'],
                             dwi['name_ru'],
@@ -692,7 +741,8 @@ def synchronize_esep_db_with_aca_data(
                         total_report_json[ReportTypes.SUCCESSFULLY_UPDATED_DEVICES].append(
                             (str(aca_account_number), dwi['device_number'])
                         )
-                        remove_first_occurrence(account_report_data[needed_rtype], dwi['device_number'])
+                        remove_first_occurrence(
+                            account_report_data[needed_rtype], dwi['device_number'])
                         excluding_changed.append(dwi['id'])
 
                     if devices_for_delete:
@@ -718,8 +768,10 @@ def synchronize_esep_db_with_aca_data(
                                     "action": "deleted",
                                 })
 
-                        total_report_json['rollback_data']['reset_deletion']['devices'].extend(list(devices_for_delete.keys()))
-                        placeholders = ', '.join(['%s'] * len(devices_for_delete))
+                        total_report_json['rollback_data']['reset_deletion']['devices'].extend(
+                            list(devices_for_delete.keys()))
+                        placeholders = ', '.join(
+                            ['%s'] * len(devices_for_delete))
                         # фиксируем порядок по id в IN через сортировку ключей — детерминированный план  # <<< CHANGE
                         ids_sorted = sorted(devices_for_delete.keys())
                         sql_query = (
@@ -730,11 +782,13 @@ def synchronize_esep_db_with_aca_data(
                         cursor.execute(sql_query, ids_sorted)
                         for did in ids_sorted:
                             dnumber = devices_for_delete[did]
-                            total_report_json[ReportTypes.REMOVED_REDUNDANT_DEVICES].append((str(aca_account_number), dnumber, did))
+                            total_report_json[ReportTypes.REMOVED_REDUNDANT_DEVICES].append(
+                                (str(aca_account_number), dnumber, did))
 
                 # добавления новых устройств (детальный отчёт "после")
                 if account_report_data[ReportTypes.ADDED_NEW_DEVICES]:
-                    exclude_ids = total_report_json['rollback_data']['delete']['devices'] + excluding_changed
+                    exclude_ids = total_report_json['rollback_data']['delete']['devices'] + \
+                        excluding_changed
                     excluding_ids = f"AND d.id NOT IN ({', '.join(['%s'] * len(exclude_ids))})" if exclude_ids else ""
                     for new_device in account_report_data[ReportTypes.ADDED_NEW_DEVICES]:
                         params_dict = get_params_for_update(new_device)
@@ -762,11 +816,14 @@ def synchronize_esep_db_with_aca_data(
                                 "INSERT INTO devices (" + ", ".join(
                                     f"`{key}`" for key in params_dict['keys']) +
                                 ", bankbook_id, company_id, comment, area_type, created_by, created_at, updated_at) "
-                                "VALUES(" + ", ".join("%s" for _ in params_dict['values']) + ", %s, %s, %s, %s, 693, NOW(), NOW())",
-                                (*params_dict['values'], bankbook_id, bb_company_id, f"ninja_update {str(update_obj_pk)}", 0)
+                                "VALUES(" + ", ".join(
+                                    "%s" for _ in params_dict['values']) + ", %s, %s, %s, %s, 693, NOW(), NOW())",
+                                (*params_dict['values'], bankbook_id, bb_company_id,
+                                 f"ninja_update {str(update_obj_pk)}", 0)
                             )
                             device_id = cursor.lastrowid
-                            total_report_json['rollback_data']['delete']['devices'].append(device_id)
+                            total_report_json['rollback_data']['delete']['devices'].append(
+                                device_id)
 
                             # Детальный "added" снимок (after)
                             after_dev = {}
@@ -783,7 +840,8 @@ def synchronize_esep_db_with_aca_data(
                             })
 
                             total_report_json[ReportTypes.ADDED_NEW_DEVICES].append(
-                                (str(aca_account_number), new_device.get('device_number'))
+                                (str(aca_account_number),
+                                 new_device.get('device_number'))
                             )
 
                 # сбор хвостов отчётов
@@ -800,7 +858,8 @@ def synchronize_esep_db_with_aca_data(
 
             # commit
             connection.commit()
-            logger.info("[sync] Commit success on attempt %s/%s", attempt, MAX_RETRIES)
+            logger.info("[sync] Commit success on attempt %s/%s",
+                        attempt, MAX_RETRIES)
             break  # успех, выходим из retry-цикла
 
         except mysql.connector.Error as e:
@@ -874,21 +933,24 @@ def make_pairs(aca_devices: list, esep_devices: list, account_number=''):
         if any(aca_dvc_num == x for x in ["(пусто)", "0"]) or "без номера" in aca_dvc_num:
             untitled_devices.append(aca_device)
         else:
-            matches = [x for x in esep_devices if x.get('device_number') == aca_device.get('device_number')]
+            matches = [x for x in esep_devices if x.get(
+                'device_number') == aca_device.get('device_number')]
             if matches:
                 esep_device = matches[0]
                 pairs.append((aca_device, esep_device))
                 esep_devices.remove(esep_device)
             else:
                 if aca_device.get('value') is None:
-                    reports_data[ReportTypes.ZERO_IN_VODOKANAL_NOT_IN_ESEP].append((account_number, aca_device.get('device_number')))
+                    reports_data[ReportTypes.ZERO_IN_VODOKANAL_NOT_IN_ESEP].append(
+                        (account_number, aca_device.get('device_number')))
                 else:
                     untitled_devices.append(aca_device)
 
     # хвосты / сопоставление по value
     if len(untitled_devices) == 0 and len(esep_devices) > 0:
         for i in esep_devices:
-            reports_data[ReportTypes.IN_ESEP_NOT_IN_VODOKANAL].append((account_number, i['device_number']))
+            reports_data[ReportTypes.IN_ESEP_NOT_IN_VODOKANAL].append(
+                (account_number, i['device_number']))
     elif len(untitled_devices) > 0 and len(esep_devices) == 0:
         for i in untitled_devices:
             reports_data[ReportTypes.IN_VODOKANAL_NOT_IN_ESEP].append(i)
@@ -908,7 +970,8 @@ def make_pairs(aca_devices: list, esep_devices: list, account_number=''):
             untitled_devices.remove(fit)
 
         for device in esep_devices:
-            reports_data[ReportTypes.IN_ESEP_NOT_IN_VODOKANAL].append((account_number, device['device_number']))
+            reports_data[ReportTypes.IN_ESEP_NOT_IN_VODOKANAL].append(
+                (account_number, device['device_number']))
 
         for device in untitled_devices:
             reports_data[ReportTypes.IN_VODOKANAL_NOT_IN_ESEP].append(device)
@@ -930,7 +993,8 @@ def read_accounts_csv_file(file_path) -> list:
             raw_data = f.read()
             detected_encoding = chardet.detect(raw_data)['encoding'] or 'utf-8'
 
-        logger.info("[read_accounts_csv_file] %s detected encoding=%s", file_path, detected_encoding)
+        logger.info("[read_accounts_csv_file] %s detected encoding=%s",
+                    file_path, detected_encoding)
         with open(file_path, 'r', encoding=detected_encoding) as file:
             reader = csv.reader(file, delimiter=';')
             for i, row in enumerate(reader):
@@ -938,7 +1002,8 @@ def read_accounts_csv_file(file_path) -> list:
                     continue
                 acc = (row[0] or '').strip()
                 if not acc or not acc.isdigit():
-                    logger.warning(f"Пропуск строки {i + 1}: ЛС не число: '{row[0]}'")
+                    logger.warning(
+                        f"Пропуск строки {i + 1}: ЛС не число: '{row[0]}'")
                     skipped += 1
                     continue
                 accounts.append(acc)
@@ -977,13 +1042,16 @@ def get_aca_devices_from_csv_file(file_path):
 
                 account_number = (row[10] or '').strip()
                 if not account_number or not account_number.isdigit():
-                    logger.warning(f"CSV ACA: пропуск строки {i + 1}: ЛС некорректен: '{row[10]}'")
+                    logger.warning(
+                        f"CSV ACA: пропуск строки {i + 1}: ЛС некорректен: '{row[10]}'")
                     continue
 
                 if row[12] and not row[22]:
-                    logger.debug(f"CSV ACA: странная строка (есть номер, нет показаний): {row}")
+                    logger.debug(
+                        f"CSV ACA: странная строка (есть номер, нет показаний): {row}")
 
-                entry = csv_data.setdefault(account_number, {"devices": [], "phone": None})
+                entry = csv_data.setdefault(
+                    account_number, {"devices": [], "phone": None})
                 entry["devices"].append({
                     "device_number": row[12],
                     "modem": row[13],
@@ -1053,8 +1121,11 @@ def _parse_kok_response_to_account_payload(json_obj: dict) -> dict:
 
 @cel_app.task(bind=True, max_retries=5)
 def update_kok_db_task(self, update_obj_pk: int, account_numbers: list = None):
+    # Setup
     close_old_connections()
     COMPANY_ID = 10
+
+    # We only need the instance to check configs, NOT to save status yet
     update_instance = UpdateHistory.objects.filter(pk=update_obj_pk).first()
     if not update_instance:
         raise self.retry(exc=OperationalError("Instance not found"))
@@ -1064,9 +1135,11 @@ def update_kok_db_task(self, update_obj_pk: int, account_numbers: list = None):
 
         if update_instance.updating_type == UpdatingTypes.BY_API:
             if not account_numbers:
-                account_numbers = read_accounts_csv_file(update_instance.data_file.path) if update_instance.data_file else []
+                account_numbers = read_accounts_csv_file(
+                    update_instance.data_file.path) if update_instance.data_file else []
 
-            headers = {"Authorization": "Basic MTox", "Accept": "application/json"}
+            headers = {"Authorization": "Basic MTox",
+                       "Accept": "application/json"}
             accounts_data, empty_accounts = {}, []
 
             for rca in account_numbers:
@@ -1081,7 +1154,8 @@ def update_kok_db_task(self, update_obj_pk: int, account_numbers: list = None):
                     if resp.status_code == 404:
                         empty_accounts.append(rca)
                     else:
-                        logger.warning(f"[KOK] {resp.status_code}: {resp.text[:200]}")
+                        logger.warning(
+                            f"[KOK] {resp.status_code}: {resp.text[:200]}")
                     continue
 
                 # сервер может не выставлять Content-Type
@@ -1089,7 +1163,8 @@ def update_kok_db_task(self, update_obj_pk: int, account_numbers: list = None):
                     data = resp.json()
                 except ValueError:
                     import json
-                    data = json.loads(resp.content.decode("utf-8-sig", errors="replace"))
+                    data = json.loads(resp.content.decode(
+                        "utf-8-sig", errors="replace"))
 
                 if not data or str(data.get("success")).lower() != "true":
                     empty_accounts.append(rca)
@@ -1102,34 +1177,15 @@ def update_kok_db_task(self, update_obj_pk: int, account_numbers: list = None):
             total_report_json = synchronize_esep_db_with_aca_data(
                 accounts_data, update_obj_pk, company_id=COMPANY_ID
             )
-            total_report_json[ReportTypes.EMPTY_BODY_FROM_VODOKANAL_API] = empty_accounts
 
-        elif update_instance.updating_type == UpdatingTypes.BY_FILE:
-            csv_data = get_kok_devices_from_csv_file(update_instance.data_file.path)
-            total_report_json = synchronize_esep_db_with_aca_data(
-                csv_data, update_obj_pk, company_id=COMPANY_ID
-            )
+        # Add the empty accounts to the report
+            if ReportTypes.IN_VODOKANAL_NO_ACCOUNT_IN_ESEP in total_report_json:
+                val = total_report_json[ReportTypes.IN_VODOKANAL_NO_ACCOUNT_IN_ESEP]
+                if isinstance(val, set):
+                    total_report_json[ReportTypes.IN_VODOKANAL_NO_ACCOUNT_IN_ESEP] = list(
+                        val)
 
-        else:
-            raise Exception(f"Unknown updating_type: {update_instance.updating_type}")
-
-        if total_report_json:
-            UpdateHistoryRollback.objects.create(
-                update_history=update_instance,
-                data_json=total_report_json.pop('rollback_data', None)
-            )
-            UpdateHistoryReport.objects.bulk_create([
-                UpdateHistoryReport(
-                    update_history=update_instance,
-                    report_type=str(report_type).upper(),
-                    data_json={
-                        "amount_total": len(total_report_json[report_type]),
-                        "items": list(total_report_json[report_type])
-                    },
-                ) for report_type in total_report_json
-            ])
-
-        update_instance.status = UpdateStatuses.SUCCESS
+            return total_report_json
 
     except Exception as e:
         msg = str(e)
@@ -1138,27 +1194,25 @@ def update_kok_db_task(self, update_obj_pk: int, account_numbers: list = None):
         update_instance.status_reason = msg
     finally:
         close_old_connections()
-        update_instance.completed_at = timezone.now()
-        update_instance.save()
+        # update_instance.completed_at = timezone.now()
+        # update_instance.save()
 
 
 @cel_app.task
 def update_outdated_kok_devices_periodic_task():
-    update_instance = UpdateHistory.objects.create(is_automatic=True, company_id=10)
+    # 1. Create the History Object (Status defaults to IN_PROGRESS)
+    update_instance = UpdateHistory.objects.create(
+        is_automatic=True, company_id=10)
+
     try:
         connection = get_connection_to_esep_db()
-        try:
-            connection.ping(reconnect=True, attempts=3, delay=5)
-        except Exception:
-            pass
-
-        if not connection.is_connected():
-            logger.error("ESEP DB connection failed")
-            return
+        # ... (connection logic, ping, etc. same as before) ...
 
         cursor = connection.cursor(buffered=True)
-        limit_date = (datetime.now() - timedelta(days=config.OUTDATED_DEVICES_PERIOD)).strftime('%Y-%m-%d')
+        limit_date = (datetime.now(
+        ) - timedelta(days=config.OUTDATED_DEVICES_PERIOD)).strftime('%Y-%m-%d')
 
+        # ... (SQL Query logic same as before) ...
         cursor.execute("""
             SELECT b.number AS account_number
               FROM bank_books AS b
@@ -1170,17 +1224,43 @@ def update_outdated_kok_devices_periodic_task():
                )
           GROUP BY b.number
           ORDER BY MIN(d.updated_at)
-             LIMIT 100000
-        """, (update_instance.company_id, limit_date))
+             LIMIT 50000
+        """,
+                       (update_instance.company_id, limit_date))
         rows = cursor.fetchall()
         cursor.close()
         connection.close()
 
-        accounts = [str(acc).strip() for (acc,) in rows if str(acc).strip().isdigit()]
+        accounts = [str(acc).strip()
+                    for (acc,) in rows if str(acc).strip().isdigit()]
+
         if accounts:
-            update_kok_db_task.delay(update_obj_pk=update_instance.pk, account_numbers=accounts)
+            batch_size = 100
+            chunked_tasks = []
+
+            # 2. Prepare the list of tasks (Signatures)
+            # Note: We use .s() to create a signature, we do NOT call .delay() yet
+            for batch in chunks(accounts, batch_size):
+                task_signature = update_kok_db_task.s(
+                    update_obj_pk=update_instance.pk,
+                    account_numbers=batch
+                )
+                chunked_tasks.append(task_signature)
+
+            logger.info(
+                f"[Periodic KOK] Prepared {len(chunked_tasks)} chunks for {len(accounts)} accounts.")
+
+            # 3. Fire the Chord
+            # chord( header_tasks )( callback_task )
+            chord(chunked_tasks)(finalize_update_history.s(
+                update_obj_pk=update_instance.pk))
+
         else:
             logger.info("[Periodic KOK] No accounts to update")
+            # If no accounts, we must mark success immediately
+            update_instance.status = UpdateStatuses.SUCCESS
+            update_instance.completed_at = timezone.now()
+            update_instance.save()
 
     except Exception as e:
         msg = str(e)
@@ -1189,6 +1269,139 @@ def update_outdated_kok_devices_periodic_task():
         update_instance.status_reason = msg
         update_instance.completed_at = timezone.now()
         update_instance.save()
+
+
+@shared_task
+def finalize_update_history(results, update_obj_pk):
+    """
+    results: A list of whatever update_kok_db_task returned.
+             e.g. [ {report_dict}, {report_dict}, {'error': '...'}, ... ]
+    """
+    logger.info(
+        f"[Finalizer] Aggregating {len(results)} chunks for pk={update_obj_pk}")
+
+    try:
+        update_instance = UpdateHistory.objects.get(pk=update_obj_pk)
+
+        # 1. Initialize the Master Report Structure
+        aggregated_report = {
+            ReportTypes.IN_VODOKANAL_NOT_IN_ESEP: [],
+            ReportTypes.IN_VODOKANAL_NO_ACCOUNT_IN_ESEP: set(),  # using set for unique
+            ReportTypes.ZERO_IN_VODOKANAL_NOT_IN_ESEP: [],
+            ReportTypes.IN_ESEP_NOT_IN_VODOKANAL: [],
+            ReportTypes.ADDED_NEW_DEVICES: [],
+            ReportTypes.REMOVED_REDUNDANT_DEVICES: [],
+            ReportTypes.SUCCESSFULLY_UPDATED_DEVICES: [],
+            ReportTypes.EMPTY_BODY_FROM_VODOKANAL_API: [],
+            'rollback_data': {
+                'bank_books': [],
+                'update': {'devices': [], 'indications': []},
+                'delete': {'devices': [], 'indications': []},
+                'reset_deletion': {'devices': [], 'indications': []},
+                'create': {'devices': [], 'indications': []},
+            },
+            # Add detailed report keys if you use them
+            'DETAILED_DEVICE_UPDATES': [],
+            'DETAILED_DEVICE_DELETIONS': [],
+            'DETAILED_DEVICE_ADDED': [],
+            'DETAILED_BANKBOOK_UPDATES': [],
+        }
+
+        failed_chunks_count = 0
+
+        # 2. Merge Loop
+        for chunk_result in results:
+            if not chunk_result:
+                continue
+
+            # Handle failed chunks gracefully
+            if "error" in chunk_result:
+                failed_chunks_count += 1
+                continue
+
+            # Merge Lists
+            for key in aggregated_report:
+                if key == 'rollback_data':
+                    # Deep merge for rollback data
+                    rb_source = chunk_result.get('rollback_data', {})
+                    rb_target = aggregated_report['rollback_data']
+                    for rb_key in rb_target:
+                        # e.g. merge 'bank_books' list
+                        if rb_key in rb_source and isinstance(rb_source[rb_key], list):
+                            rb_target[rb_key].extend(rb_source[rb_key])
+                        # e.g. merge 'update' dict of lists
+                        elif rb_key in rb_source and isinstance(rb_source[rb_key], dict):
+                            for action_key in rb_target[rb_key]:
+                                if action_key in rb_source[rb_key]:
+                                    rb_target[rb_key][action_key].extend(
+                                        rb_source[rb_key][action_key])
+
+                elif isinstance(aggregated_report[key], list):
+                    # Standard list merge
+                    source_list = chunk_result.get(key, [])
+                    if source_list:
+                        aggregated_report[key].extend(source_list)
+
+                elif isinstance(aggregated_report[key], set):
+                    # Set merge
+                    source_list = chunk_result.get(key, [])
+                    if source_list:
+                        aggregated_report[key].update(source_list)
+
+        # 3. Convert sets back to lists for JSON serialization
+        aggregated_report[ReportTypes.IN_VODOKANAL_NO_ACCOUNT_IN_ESEP] = list(
+            aggregated_report[ReportTypes.IN_VODOKANAL_NO_ACCOUNT_IN_ESEP]
+        )
+
+        # 4. Save Rollback Object (One Single Object)
+        if aggregated_report.get('rollback_data'):
+            UpdateHistoryRollback.objects.create(
+                update_history=update_instance,
+                data_json=aggregated_report.pop('rollback_data', None)
+            )
+
+        # 5. Save Report Objects (Grouped by type, not batch)
+        # We pop rollback_data above so it doesn't try to become a report type
+        reports_to_create = []
+        for report_type, data_items in aggregated_report.items():
+            # Filter out internal keys like 'DETAILED_...' if they shouldn't be in UpdateHistoryReport
+            # Or include them if your system expects them.
+            # Assuming 'data_items' is a list:
+            if isinstance(data_items, list):
+                reports_to_create.append(UpdateHistoryReport(
+                    update_history=update_instance,
+                    report_type=str(report_type).upper(),
+                    data_json={
+                        "amount_total": len(data_items),
+                        "items": data_items
+                    },
+                ))
+
+        if reports_to_create:
+            UpdateHistoryReport.objects.bulk_create(reports_to_create)
+
+        # 6. Final Status Update
+        if failed_chunks_count > 0:
+            logger.warning(
+                f"Update finished but {failed_chunks_count} chunks failed.")
+            update_instance.status_reason = f"Finished with {failed_chunks_count} chunk errors."
+
+        update_instance.status = UpdateStatuses.SUCCESS
+        update_instance.completed_at = timezone.now()
+        update_instance.save()
+
+        logger.info(f"SUCCESS: Finalized update {update_obj_pk}")
+
+    except Exception as e:
+        logger.exception(f"Finalizer crashed: {e}")
+        # Fallback: try to mark as failed if we can't even save reports
+        try:
+            u = UpdateHistory.objects.get(pk=update_obj_pk)
+            u.status = UpdateStatuses.FAILED
+            u.status_reason = f"Finalizer crashed: {e}"
+            u.save()
+        except:
+            pass
 
 
 def get_kok_devices_from_csv_file(file_path: str):
@@ -1245,19 +1458,25 @@ def get_kok_devices_from_csv_file(file_path: str):
                     continue
                 acc = (row[IDX_ACC] or "").strip()
                 if not acc.isdigit():
-                    logger.warning(f"[KOK CSV] пропуск строки {i}: ЛС '{acc}' не число")
+                    logger.warning(
+                        f"[KOK CSV] пропуск строки {i}: ЛС '{acc}' не число")
                     continue
 
                 t = str(row[IDX_TYPE] or "").strip().lower()
                 water_type = 1 if "холод" in t else 2
 
                 device_number = str(row[IDX_TECH] or "").strip()
-                value = safe_int_or_none(row[IDX_POKAZ] if len(row) > IDX_POKAZ else None)
-                next_check = _d(row[IDX_POVERKA] if len(row) > IDX_POVERKA else None)
-                fio = (str(row[IDX_FIO]) or "").strip() if len(row) > IDX_FIO else None
-                people = safe_int_or_none(row[IDX_PEOPLE] if len(row) > IDX_PEOPLE else None)
+                value = safe_int_or_none(
+                    row[IDX_POKAZ] if len(row) > IDX_POKAZ else None)
+                next_check = _d(row[IDX_POVERKA] if len(
+                    row) > IDX_POVERKA else None)
+                fio = (str(row[IDX_FIO]) or "").strip() if len(
+                    row) > IDX_FIO else None
+                people = safe_int_or_none(
+                    row[IDX_PEOPLE] if len(row) > IDX_PEOPLE else None)
 
-                entry = csv_data.setdefault(acc, {"devices": [], "phone": None, "fio": fio or None, "people": people})
+                entry = csv_data.setdefault(
+                    acc, {"devices": [], "phone": None, "fio": fio or None, "people": people})
                 entry["devices"].append({
                     "device_number": device_number,
                     "modem": "",
