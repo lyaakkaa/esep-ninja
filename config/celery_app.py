@@ -1,4 +1,5 @@
 import os
+from distutils.util import strtobool
 from celery import Celery
 from celery.schedules import crontab
 
@@ -15,7 +16,13 @@ cel_app.conf.result_backend_transport_options = {'visibility_timeout': 43200}
 cel_app.conf.visibility_timeout = 43200
 cel_app.conf.task_acks_late = True
 
-cel_app.conf.beat_schedule = {
+disable_periodic_tasks = False
+try:
+    disable_periodic_tasks = bool(strtobool(os.getenv("DISABLE_PERIODIC_TASKS", "false")))
+except (ValueError, AttributeError):
+    disable_periodic_tasks = False
+
+cel_app.conf.beat_schedule = {} if disable_periodic_tasks else {
     # ACA
     # 'update-outdated-esep-devices-periodic-task': {
     #     'task': 'apps.common.tasks.update_outdated_esep_devices_periodic_task',
